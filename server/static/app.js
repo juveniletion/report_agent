@@ -104,9 +104,74 @@ function useReveal() {
 }
 
 /* 包一层：滚动到视口时淡入 */
-function Reveal({ children, className = "" }) {
+function Reveal({ children, className = "", delay = 0 }) {
   const ref = useReveal();
-  return html`<div ref=${ref} class=${"reveal " + className}>${children}</div>`;
+  return html`<div ref=${ref} class=${"reveal " + className}
+                    style=${{ "--reveal-delay": delay + "ms" }}>${children}</div>`;
+}
+
+/* ---------------- 数字滚动 ----------------
+ * 只在首屏统计区用。用 rAF 做三次方缓出，900ms 内从 0 长到目标值。
+ * 非数字（如 "—"）原样返回，避免出现 NaN。 */
+function useCountUp(target, duration = 900, delay = 0) {
+  const [v, setV] = useState(typeof target === "number" ? 0 : target);
+  useEffect(() => {
+    if (typeof target !== "number") { setV(target); return; }
+    let raf = 0, start = 0, timer = 0;
+    const tick = t => {
+      if (!start) start = t;
+      const p = Math.min(1, (t - start) / duration);
+      setV(Math.round(target * (1 - Math.pow(1 - p, 3))));
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    timer = setTimeout(() => { raf = requestAnimationFrame(tick); }, delay);
+    return () => { clearTimeout(timer); cancelAnimationFrame(raf); };
+  }, [target, duration, delay]);
+  return v;
+}
+
+function HeroStat({ label, value, unit, index }) {
+  const v = useCountUp(value, 900, 650 + index * 90);
+  return html`
+    <div class="hero-stat" style=${{ "--i": index }}>
+      <div class="hs-value">${v}<span>${unit}</span></div>
+      <div class="hs-label">${label}</div>
+    </div>`;
+}
+
+function HeroStats({ health, notes }) {
+  const items = [
+    { label: "COVERED PRODUCTS", value: 3, unit: "个" },
+    { label: "ANALYSIS WINDOW", value: 6, unit: "个月" },
+    { label: "SOURCE DOCUMENTS", value: health ? health.sources : "—", unit: "份" },
+    { label: "DATA NOTES", value: notes ? notes.count : 0, unit: "条" },
+  ];
+  return html`<div class="hero-stats">
+    ${items.map((it, i) => html`<${HeroStat} key=${it.label} index=${i}
+      label=${it.label} value=${it.value} unit=${it.unit} />`)}
+  </div>`;
+}
+
+/* ---------------- 顶部滚动进度条 ---------------- */
+function ScrollProgress() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const onScroll = () => {
+      const el = ref.current;
+      if (!el) return;
+      const h = document.documentElement;
+      const p = h.scrollTop / Math.max(1, h.scrollHeight - h.clientHeight);
+      el.style.transform = `scaleX(${Math.min(1, Math.max(0, p))})`;
+    };
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll);
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+    };
+  }, []);
+  return html`<div class="scroll-progress" ref=${ref} aria-hidden="true"></div>`;
 }
 
 /* =============================================================================
@@ -372,6 +437,7 @@ function Profile({ me, onAuthed, onLoggedOut }) {
  * ========================================================================== */
 const CHART_FONT = '"Inter","Segoe UI","Microsoft YaHei",system-ui,sans-serif';
 const C_INK = "#1C1917", C_MUTED = "#78716C", C_FAINT = "#A8A29E", C_LINE = "#E7E5E4";
+const C_SPLIT = "#F0EFED";
 
 /* 统一的提示框样式（白色圆角卡片 + 柔影）*/
 const TOOLTIP = {
@@ -437,7 +503,7 @@ function LineChart({ series, colors, height = 320, title = "" }) {
   const months = series.map(s => s.月份.slice(5) + "月");
 
   const option = {
-    animationDuration: 420,
+    animationDuration: 900, animationEasing: "cubicOut",
     // ⚠️ legend 放 bottom:0 会与 X 轴标签重叠（实测"单位成本"压住了"03月"）。
     //    改为 legend 置顶 + grid 留出上边距，两者各占一行。
     grid: { left: 8, right: 16, top: 42, bottom: 8, containLabel: true },
@@ -457,15 +523,18 @@ function LineChart({ series, colors, height = 320, title = "" }) {
     },
     yAxis: {
       type: "value", scale: true,
-      splitLine: { lineStyle: { color: "#F0EFED", type: "dashed" } },
+      splitLine: { lineStyle: { color: C_SPLIT, type: "dashed" } },
       axisLabel: { color: C_FAINT, fontSize: 12, fontFamily: CHART_FONT },
     },
-    series: colors.map(c => ({
+    series: colors.map((c, idx) => ({
       name: c.label,
       type: "line",
       smooth: 0.28,
       symbol: "circle",
       symbolSize: 7,
+      animationDuration: 1100,
+      animationDelay: 120 + idx * 110,
+      animationEasing: "cubicOut",
       lineStyle: { width: 2.5, color: c.color },
       itemStyle: { color: "#fff", borderColor: c.color, borderWidth: 2.5 },
       emphasis: { focus: "series" },
@@ -482,7 +551,7 @@ function BarChart({ items, height = 300, title = "" }) {
   if (!items.length) return html`<div class="empty">该月份暂无数据</div>`;
 
   const option = {
-    animationDuration: 420,
+    animationDuration: 900, animationEasing: "cubicOut",
     grid: { left: 8, right: 16, top: 34, bottom: 8, containLabel: true },
     tooltip: {
       ...TOOLTIP,
@@ -498,7 +567,7 @@ function BarChart({ items, height = 300, title = "" }) {
     },
     yAxis: {
       type: "value",
-      splitLine: { lineStyle: { color: "#F0EFED", type: "dashed" } },
+      splitLine: { lineStyle: { color: C_SPLIT, type: "dashed" } },
       axisLabel: { color: C_FAINT, fontSize: 12, fontFamily: CHART_FONT },
     },
     series: [{
@@ -577,7 +646,7 @@ function WaterfallChart({ rows, height = 330, title = "" }) {
   });
 
   const option = {
-    animationDuration: 420,
+    animationDuration: 900, animationEasing: "cubicOut",
     grid: { left: 8, right: 16, top: 32, bottom: 8, containLabel: true },
     tooltip: {
       ...TOOLTIP, trigger: "axis", axisPointer: { type: "shadow" },
@@ -601,7 +670,7 @@ function WaterfallChart({ rows, height = 330, title = "" }) {
     },
     yAxis: {
       type: "value", scale: true,
-      splitLine: { lineStyle: { color: "#F0EFED", type: "dashed" } },
+      splitLine: { lineStyle: { color: C_SPLIT, type: "dashed" } },
       axisLabel: { color: C_FAINT, fontSize: 12, fontFamily: CHART_FONT },
     },
     series: [
@@ -624,7 +693,7 @@ function DonutChart({ items, total, unit, height = 300, title = "" }) {
   if (!sum) return html`<div class="empty">该月份无结构数据</div>`;
 
   const option = {
-    animationDuration: 420,
+    animationDuration: 900, animationEasing: "cubicOut",
     tooltip: {
       ...TOOLTIP, trigger: "item",
       formatter: p => `${p.name}<br/><b>${Number(p.value).toFixed(2)}</b> 元/盒`
@@ -691,9 +760,12 @@ const GRAPH_COLORS = {
   incident:  "#B45309",
   anomaly:   "#BE123C",
   peer:      "#7C3AED",
+  factory:   "#115E59",   // 工厂：比产品更深一档
+  cost:      "#B45309",   // 成本要素
+  market:    "#0284C7",   // 行情药材
 };
 
-function GraphChart({ data, height = 460, selected, onSelect, fitKey }) {
+function GraphChart({ data, height = 460, focus = "", selected, onSelect, fitKey }) {
   const inst = useRef(null);
   const boxRef = useRef(null);
 
@@ -708,7 +780,7 @@ function GraphChart({ data, height = 460, selected, onSelect, fitKey }) {
     });
 
     inst.current.setOption({
-      animationDuration: 600,
+      animationDuration: 1000, animationEasing: "cubicOut",
       tooltip: {
         ...TOOLTIP, trigger: "item", confine: true,
         formatter: p => {
@@ -749,8 +821,11 @@ function GraphChart({ data, height = 460, selected, onSelect, fitKey }) {
         //    一圈原料/工序/设备），圆形会把边全挤到中心打结。
         //    力导向才对。调参目标：让外围节点摊开、别挤成一坨。
         //    friction 提高 + gravity 略增 → 收敛更快，减少"点不准"的漂移。
-        force: { repulsion: 520, edgeLength: [90, 170], gravity: 0.03,
-                 layoutAnimation: true, friction: 0.2 },
+        force: {
+          repulsion: data.nodes.length > 30 ? 1200 : 900,
+          edgeLength: data.nodes.length > 30 ? [140, 260] : [120, 220],
+          gravity: 0.04, layoutAnimation: true, friction: 0.2,
+        },
         // 标签只给"重要的"（度数高的）显示；全显示会糊成一片。
         // 阈值不能太高——实测 deg>=3 时只剩 3~4 个标签，等于没标。
         label: {
@@ -759,7 +834,7 @@ function GraphChart({ data, height = 460, selected, onSelect, fitKey }) {
           fontSize: 11.5,
           fontFamily: CHART_FONT,
           color: C_INK,
-          formatter: p => (deg[p.data.id] >= 2 ? p.data.name : ""),
+          formatter: p => (p.data.id === focus || deg[p.data.id] >= 2 ? p.data.name : ""),
         },
         // 选中的节点加一圈描边（用 ECharts 内建 select，不重设 data，避免重跑布局）
         select: {
@@ -774,12 +849,23 @@ function GraphChart({ data, height = 460, selected, onSelect, fitKey }) {
           label: { show: true, fontWeight: 700 },
           lineStyle: { width: 2.4, color: "#0F766E" },
         },
-        data: data.nodes.map(n => ({
-          id: n.id, name: n.label,
-          raw: { ...n, typeZh: (data.type_zh || {})[n.type] || n.type },
-          symbolSize: Math.min(42, 12 + (deg[n.id] || 0) * 3.2),
-          itemStyle: { color: GRAPH_COLORS[n.type] || "#78716C" },
-        })),
+        data: data.nodes.map(n => {
+          const isFocus = n.id === focus;
+          const size = Math.min(42, 12 + (deg[n.id] || 0) * 3.2);
+          return {
+            id: n.id, name: n.label,
+            raw: { ...n, typeZh: (data.type_zh || {})[n.type] || n.type },
+            symbolSize: isFocus ? Math.max(56, size) : size,
+            itemStyle: isFocus
+              ? { color: GRAPH_COLORS[n.type] || "#78716C",
+                  borderColor: "#0F766E", borderWidth: 4,
+                  shadowBlur: 18, shadowColor: "rgba(15,118,110,.35)" }
+              : { color: GRAPH_COLORS[n.type] || "#78716C" },
+            label: isFocus
+              ? { show: true, fontSize: 14, fontWeight: 700, color: C_INK }
+              : undefined,
+          };
+        }),
         edges: data.edges.map(e => ({
           source: e.src, target: e.dst, relation: e.relation,
         })),
@@ -801,7 +887,7 @@ function GraphChart({ data, height = 460, selected, onSelect, fitKey }) {
       window.removeEventListener("resize", onResize);
       if (inst.current) { inst.current.dispose(); inst.current = null; }
     };
-  }, [data]);
+  }, [data, focus]);
 
   /* "重置视图"不走这里——由父组件换 `key` 让本组件**整个重新挂载**。
    * 试过在当前实例上复位 roam 状态：ECharts 的 graph 没有干净的
@@ -813,11 +899,15 @@ function GraphChart({ data, height = 460, selected, onSelect, fitKey }) {
 }
 
 /* 图例：告诉用户颜色代表什么 */
-function GraphLegend({ typeZh }) {
+function GraphLegend({ typeZh, types }) {
+  // 只显示当前子图里真正出现的类型，避免图例里堆一堆空类别。
+  const keys = (types && types.length
+    ? Object.keys(GRAPH_COLORS).filter(k => types.includes(k))
+    : Object.keys(GRAPH_COLORS));
   return html`
     <div class="glegend">
-      ${Object.entries(GRAPH_COLORS).map(([k, c]) => html`
-        <span key=${k}><i style=${{ background: c }}></i>${(typeZh || {})[k] || k}</span>`)}
+      ${keys.map(k => html`
+        <span key=${k}><i style=${{ background: GRAPH_COLORS[k] }}></i>${(typeZh || {})[k] || k}</span>`)}
     </div>`;
 }
 
@@ -851,7 +941,7 @@ function HeatmapChart({ data, element, height = 300, title = "" }) {
 
   const bound = data.bound || 1;
   const option = {
-    animationDuration: 400,
+    animationDuration: 900, animationEasing: "cubicOut",
     grid: { left: 8, right: 16, top: 12, bottom: 46, containLabel: true },
     tooltip: {
       ...TOOLTIP, trigger: "item",
@@ -1708,7 +1798,7 @@ function Rectify({ me, onNeedLogin, onAuthed }) {
  *    这里和「上传区」的处理不同：上传区是滑到才看见的次要功能，
  *    而问答区在首屏——摆一个点了没反应的输入框比给张登录卡更让人困惑。
  * ========================================================================== */
-function HeroAsk({ me, onNeedLogin, onAuthed }) {
+function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
   const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1912,19 +2002,29 @@ function HeroAsk({ me, onNeedLogin, onAuthed }) {
   if (!me) {
     return html`
       <section class="hero">
-        <h1 class="hero-title">基于 llm-wiki 的智能分析面板</h1>
-        <p class="hero-sub">问一句，每个数字都带你回到它的出处。</p>
-        <${LoginGate} what="智能问答（查的是你自己的数据区）"
-                      onGoLogin=${onNeedLogin} />
+        <div class="hero-inner">
+          <div class="eyebrow">AI-NATIVE COST INTELLIGENCE</div>
+          <h1 class="hero-title">制药成本智能分析</h1>
+          <p class="hero-sub">问一句，每个数字都带你回到它的出处。</p>
+          <div class="hero-ask">
+            <${LoginGate} what="智能问答（查的是你自己的数据区）"
+                          onGoLogin=${onNeedLogin} />
+          </div>
+          <${HeroStats} health=${health} notes=${notes} />
+          <div class="hero-scroll">SCROLL TO EXPLORE <span>↓</span></div>
+        </div>
       </section>`;
   }
 
   return html`
     <section class="hero">
-      <h1 class="hero-title">基于 llm-wiki 的智能分析面板</h1>
-      <p class="hero-sub">问一句，每个数字都带你回到它的出处。</p>
+      <div class="hero-inner">
+        <div class="eyebrow">AI-NATIVE COST INTELLIGENCE</div>
+        <h1 class="hero-title">制药成本智能分析</h1>
+        <p class="hero-sub">问一句，每个数字都带你回到它的出处。</p>
 
-      <div class="conv-bar">
+        <div class="hero-ask">
+          <div class="conv-bar">
         <span class="conv-label">会话</span>
         <select class="conv-select" value=${convId == null ? "" : String(convId)}
                 disabled=${busy}
@@ -1957,6 +2057,9 @@ function HeroAsk({ me, onNeedLogin, onAuthed }) {
           ${SUGGEST.map((s, i) => html`
             <button key=${i} class="chip" onClick=${() => ask(s)}>${s}</button>`)}
         </div>` : null}
+        </div>
+
+        <${HeroStats} health=${health} notes=${notes} />
 
       ${msgs.length ? html`
         <div class="chat" ref=${boxRef}>
@@ -2008,6 +2111,9 @@ function HeroAsk({ me, onNeedLogin, onAuthed }) {
               </div>`;
           })}
         </div>` : null}
+
+        <div class="hero-scroll">SCROLL TO EXPLORE <span>↓</span></div>
+      </div>
     </section>`;
 }
 
@@ -2099,9 +2205,11 @@ function UploadZone({ me, onNeedLogin, onChanged }) {
 
   return html`
     <section class="home-sec">
-      <h2 class="sec-title">让知识库更懂你的厂
-        <span class="sec-hint">仅你可见</span>
-      </h2>
+      <div class="sec-head">
+        <h2 class="sec-title">让知识库更懂你的厂
+          <span class="sec-hint">仅你可见</span>
+        </h2>
+      </div>
       <p class="sec-sub">
         拖入你手头的资料（报表、工艺说明、检查记录…），会被编译进
         <strong>你自己的</strong>知识库，检索与问答都能用到。
@@ -2256,7 +2364,7 @@ function ReportGen({ me, onGenerated }) {
         body: { product, month, theme, period },
       });
       if (r._error) throw new Error(r._error);
-      setMsg(`已生成 ${r.file}（${r.stats.deterministic_fields} 个确定性值）`);
+      setMsg(r.message || `已生成 ${r.file}（${r.stats.deterministic_fields} 个确定性值）`);
       onGenerated && onGenerated();
     } catch (e) { setErr("生成失败：" + String(e.message || e)); }
     setBusy(false);
@@ -2648,7 +2756,7 @@ function HomeHeatmap() {
 /* 知识图谱（赛题 6.2 加分项的前端呈现） */
 function HomeGraph() {
   const [focus, setFocus] = useState("银黄口服液");
-  const [hops, setHops] = useState(2);
+  const [hops, setHops] = useState(1);
   /* key：换中心 / 换跳数 / 点"重置视图"时 +1，让图**整个重新挂载**。
    * 图谱的力导向布局每次都会重算，所以重挂载后落点也变——
    * 这是布局本身的性质，不是 bug；用户要的是"能主动重置"。 */
@@ -2669,7 +2777,7 @@ function HomeGraph() {
     <section class="home-sec">
       <div class="sec-head">
         <h2 class="sec-title">知识图谱
-          <span class="sec-hint">配方 · 工艺 · 设备 · 成本异动</span>
+          <span class="sec-hint">原料 · 成本 · 设备 · 行情</span>
         </h2>
         <div class="toolbar">
           <select value=${focus} onChange=${e => { setFocus(e.target.value); setSel(null); }}>
@@ -2685,7 +2793,7 @@ function HomeGraph() {
         </div>
       </div>
       <p class="sec-sub">
-        从产品出发穿透到它的原料、工序与设备。
+        从产品出发穿透到它的原料、成本要素、设备与行情。
         <strong>检索给你一段话，图谱给你一条路径</strong>——
         所以它能回答「成本上涨经过了哪些环节」，而不只是「哪段文字提到了它」。
       </p>
@@ -2695,9 +2803,11 @@ function HomeGraph() {
           : error ? html`<${ErrorBox} msg=${error} />`
           : data && !data.ok ? html`<div class="msg err">${data.error}</div>`
           : html`
-            <${GraphChart} key=${viewKey} data=${data}
+            <${GraphChart} key=${viewKey} data=${data} focus=${focus}
+                           height=${hops === 1 ? 560 : 740}
                            selected=${sel} onSelect=${setSel} />
-            <${GraphLegend} typeZh=${(data && data.type_zh) || {}} />
+            <${GraphLegend} typeZh=${(data && data.type_zh) || {}}
+                           types=${[...new Set((data.nodes || []).map(n => n.type))]} />
 
             ${/* 选中后的操作条 —— "查看"与"以它为中心"分成两步，
                  不会因为点错一下就把整个图重新布局。 */ ""}
@@ -2728,23 +2838,26 @@ function HomeGraph() {
  * 顺序是刻意的：**先问，再补资料，最后看分析**。
  * 用户的心流是「我想知道 X → 资料不够我补 → 数字都在这里」。
  * ========================================================================== */
-function Home({ me, onNeedLogin, onAuthed }) {
+function Home({ me, onNeedLogin, onAuthed, health, notes }) {
   const [month, setMonth] = useState("2026-05");
   const [wsKey, setWsKey] = useState(0);
   const topRef = useRef(null);
 
   return html`
     <div ref=${topRef}></div>
-    <${HeroAsk} me=${me} onNeedLogin=${onNeedLogin} onAuthed=${onAuthed} />
-    <${Reveal}><${UploadZone} me=${me} onNeedLogin=${onNeedLogin}
-                   onChanged=${() => setWsKey(k => k + 1)} /><//>
-    <${Reveal}><${WorkspaceList} me=${me} refreshKey=${wsKey} /><//>
-    <${Reveal}><${ExportBar} me=${me} /><//>
-    <${Reveal}><${DecideCard} /><//>
-    <${Reveal}><${HomeCharts} month=${month} setMonth=${setMonth} /><//>
-    <${Reveal}><${HomeHeatmap} /><//>
-    <${Reveal}><${HomeForecast} /><//>
-    <${Reveal}><${HomeGraph} /><//>`;
+    <${HeroAsk} me=${me} onNeedLogin=${onNeedLogin} onAuthed=${onAuthed}
+                health=${health} notes=${notes} />
+    <div class="home">
+      <${Reveal}><${UploadZone} me=${me} onNeedLogin=${onNeedLogin}
+                     onChanged=${() => setWsKey(k => k + 1)} /><//>
+      <${Reveal}><${WorkspaceList} me=${me} refreshKey=${wsKey} /><//>
+      <${Reveal}><${ExportBar} me=${me} /><//>
+      <${Reveal}><${DecideCard} /><//>
+      <${Reveal}><${HomeCharts} month=${month} setMonth=${setMonth} /><//>
+      <${Reveal}><${HomeHeatmap} /><//>
+      <${Reveal}><${HomeForecast} /><//>
+      <${Reveal}><${HomeGraph} /><//>
+    </div>`;
 }
 /* =============================================================================
  * 外壳
@@ -2846,47 +2959,46 @@ function App() {
   }
 
   return html`
+    <${ScrollProgress} />
     <header class="top">
-      <div class="wrap">
-        <div class="brandrow">
-          <div class="brand">
-            <div class="mark">析</div>
-            <div>
-              <h1>基于 llm-wiki 的智能分析面板</h1>
-              <div class="sub">制药企业成本智能分析 · 知识可溯</div>
-            </div>
+      <div class="navwrap">
+        <div class="brand">
+          <div class="mark">析</div>
+          <div class="brand-txt">
+            <h1><span class="brand-long">基于 llm-wiki 的智能分析面板</span><span class="brand-short">PharmaCost</span></h1>
+            <div class="sub">制药企业成本智能分析 · 知识可溯</div>
           </div>
-          ${who}
         </div>
-        ${health ? html`
-          <div class="scope">
-            <div>分析区间　<b>2026 年 1 – 6 月</b></div>
-            <div>覆盖产品　<b>3 个</b></div>
-            <div>依据资料　<b>${health.sources} 份</b></div>
-            ${notes ? html`<div>数据说明　<b>${notes.count} 条</b></div>` : null}
-          </div>` : html`<div class="scope"></div>`}
+        <nav class="tabs">
+          ${NAV_TABS.map(t => html`
+            <button key=${t.id} class=${tab === t.id ? "on" : ""} onClick=${() => go(t.id)}>
+              ${t.label}${t.id === "notes" && notes
+                ? html`<span class="count">${notes.count}</span>` : null}
+            </button>`)}
+        </nav>
+        <div class="nav-actions">${who}</div>
       </div>
     </header>
 
     <div class="wrap">
-      <nav class="tabs">
-        ${NAV_TABS.map(t => html`
-          <button key=${t.id} class=${tab === t.id ? "on" : ""} onClick=${() => go(t.id)}>
-            ${t.label}${t.id === "notes" && notes
-              ? html`<span class="count">${notes.count}</span>` : null}
-          </button>`)}
-      </nav>
-
-      ${tab === "home"     ? html`<${Home} me=${me} onNeedLogin=${() => go("login")}
-                                        onAuthed=${refreshMe} />` : null}
-      ${tab === "trend"    ? html`<${Trend} />` : null}
-      ${tab === "benchmark" ? html`<${Benchmark} />` : null}
-      ${tab === "notes"    ? html`<${Notes} />` : null}
-      ${tab === "history"  ? html`<${History} />` : null}
-      ${tab === "profile"  ? html`<${Profile} me=${me} onAuthed=${onAuthed}
-                                           onLoggedOut=${onLoggedOut} />` : null}
-      ${tab === "rectify"  ? html`<${Rectify} me=${me} onNeedLogin=${() => go("login")}
-                                       onAuthed=${refreshMe} />` : null}
+      <div class="page" key=${tab}>
+        ${tab !== "home" ? html`
+          <div class="page-head">
+            <div class="eyebrow">WORKSPACE · ${tab.toUpperCase()}</div>
+            <h1 class="page-title">${(TABS.find(t => t.id === tab) || {}).label || ""}</h1>
+          </div>` : null}
+        ${tab === "home"     ? html`<${Home} me=${me} onNeedLogin=${() => go("login")}
+                                          onAuthed=${refreshMe}
+                                          health=${health} notes=${notes} />` : null}
+        ${tab === "trend"    ? html`<${Trend} />` : null}
+        ${tab === "benchmark" ? html`<${Benchmark} />` : null}
+        ${tab === "notes"    ? html`<${Notes} />` : null}
+        ${tab === "history"  ? html`<${History} />` : null}
+        ${tab === "profile"  ? html`<${Profile} me=${me} onAuthed=${onAuthed}
+                                             onLoggedOut=${onLoggedOut} />` : null}
+        ${tab === "rectify"  ? html`<${Rectify} me=${me} onNeedLogin=${() => go("login")}
+                                         onAuthed=${refreshMe} />` : null}
+      </div>
 
       <footer class="foot">
         本系统所有数字均可在原始资料中逐项核对 ｜ 分析文本由 AI 辅助生成，请结合业务判断
