@@ -238,6 +238,74 @@ def fill_docx(template: Path, values: Dict[str, Any], out_path: Path,
     return out_path, seen
 
 
+def insert_chart_images(docx_path: Path, charts: List[Dict[str, Any]],
+                        width_cm: float = 14.5) -> int:
+    """
+    在**已填充**的 Word 模板中插入图表（赛题 5.1.3「图表嵌入」）。
+
+    `charts` 与 `export_doc.build_report_charts()` 同构：
+        [{"after": "### 2.2 成本结构", "image": ..., "caption": ...}, ...]
+    `after` 是 markdown 标题，这里取去掉 `### ` 后的文本，在 Word 段落里
+    按**前缀**匹配（如 "2.2 成本结构"）。找不到锚点时统一追加到文末
+    「图表附录」，**不静默丢图**。
+
+    ⚠️ 不修改原始模板——只改填充后的输出 docx。
+    :return: 实际插入的图片数量
+    """
+    if not charts:
+        return 0
+
+    import docx
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Cm, Pt, RGBColor
+
+    doc = docx.Document(str(docx_path))
+    inserted = 0
+    appendix = False
+
+    def _add_picture_after(target: Any, ch: Dict[str, Any]) -> None:
+        nonlocal inserted
+        image = ch.get("image")
+        if not image or not Path(image).exists():
+            return
+        p = doc.add_paragraph()
+        target._p.addnext(p._p)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run().add_picture(str(image), width=Cm(width_cm))
+
+        caption = ch.get("caption")
+        if caption:
+            cap = doc.add_paragraph()
+            p._p.addnext(cap._p)
+            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = cap.add_run(str(caption))
+            run.italic = True
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+        inserted += 1
+
+    for ch in charts:
+        anchor = (ch.get("after") or "").removeprefix("### ").strip()
+        target = None
+        if anchor:
+            for p in doc.paragraphs:
+                if p.text.strip().startswith(anchor):
+                    target = p
+                    break
+        if target is not None:
+            _add_picture_after(target, ch)
+            continue
+
+        # 锚点缺失（自定义模板改过标题）→ 文末附录
+        if not appendix:
+            doc.add_paragraph("图表附录")
+            appendix = True
+        _add_picture_after(doc.paragraphs[-1], ch)
+
+    doc.save(str(docx_path))
+    return inserted
+
+
 # ---------------------------------------------------------------------------
 # 自测 / 检视
 # ---------------------------------------------------------------------------
