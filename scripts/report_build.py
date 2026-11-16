@@ -913,12 +913,22 @@ def build(product: str, month: str, use_llm: bool = True,
     #   直接填那份 .docx 并保存，保留它的字体/表格样式/大纲。
     # 否则走默认的 .md 模板（产出 markdown，再按需导出 Word/PDF）。
     docx_out: Optional[Path] = None
+    charts_inserted = 0
     if template_docx is not None:
         import template_docx as TD
         docx_out, missing = TD.fill_docx(
             Path(template_docx), vals, Path(docx_out_path or (OUT_DIR / f"{product}_{month}.docx")),
             blank_keys={"重点分析段落"})
-        report = f"（已按 Word 模板生成：{docx_out.name}）"
+        # 赛题 5.1.3「图表嵌入」：Word 模板路径同样生成三张图并插入。
+        # 与 export_doc 的 markdown 导出复用同一套 chart_render 数据，不新增计算。
+        try:
+            import export_doc as ED
+            charts = ED.build_report_charts(product, month, out_dir=docx_out.parent)
+            charts_inserted = TD.insert_chart_images(docx_out, charts)
+        except Exception as e:  # noqa: BLE001
+            print(f"    ⚠️ Word 模板图表插入失败：{type(e).__name__}: {e}")
+        note = f"，含 {charts_inserted} 张图" if charts_inserted else ""
+        report = f"（已按 Word 模板生成：{docx_out.name}{note}）"
     else:
         tpl_path = TEMPLATES.get(theme, TEMPLATE)
         if not tpl_path.exists():
@@ -936,6 +946,7 @@ def build(product: str, month: str, use_llm: bool = True,
         "facts": len(fs.facts),
         "conflicts": fs.conflicts,
         "data_missing": fs.missing,
+        "charts": charts_inserted,
     }
     return {"report": report, "facts": fs, "stats": stats, "analysis": analysis,
             "docx": docx_out}
