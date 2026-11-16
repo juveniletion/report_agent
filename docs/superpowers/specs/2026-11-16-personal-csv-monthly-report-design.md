@@ -1,7 +1,7 @@
 # 个人上传成本汇总进入月度报告（MVP）设计
 
 - 日期：2026-11-16
-- 状态：待用户审阅
+- 状态：已确认（2026-11-16，用户批准实施）
 - 实现分支：`feat/personal-csv-report`
 - 范围：**只接成本汇总表**；其余 8 类报表数据仍用共享基线
 
@@ -160,6 +160,7 @@ class ReportDataContext:
   {
     "scope": "personal",
     "personal_files": ["中药一厂_成本汇总_2026年7-12月.csv"],
+    "personal_keys": ["银黄口服液&2026-05", "银黄口服液&2026-07"],
     "overridden_keys": ["银黄口服液&2026-05"],
     "shared_fallback": ["中药一厂_原材料消耗明细_2026年1-6月.csv"],
     "ignored_rows": 2,

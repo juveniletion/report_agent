@@ -306,6 +306,31 @@ def insert_chart_images(docx_path: Path, charts: List[Dict[str, Any]],
     return inserted
 
 
+def insert_source_note(docx_path: Path, note: str) -> bool:
+    """在标题后插入一行来源说明（个人报告用），只改输出 docx，不改模板。"""
+    if not note:
+        return False
+    import docx
+    from docx.shared import Pt, RGBColor
+
+    doc = docx.Document(str(docx_path))
+    if any(note in (p.text or "") for p in doc.paragraphs):
+        return False
+
+    target = next((p for p in doc.paragraphs if (p.text or "").strip()), None)
+    if target is None:
+        target = doc.add_paragraph()
+
+    p = doc.add_paragraph()
+    target._p.addnext(p._p)
+    run = p.add_run(note)
+    run.italic = True
+    run.font.size = Pt(9)
+    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+    doc.save(str(docx_path))
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 自测 / 检视
 # ---------------------------------------------------------------------------

@@ -116,6 +116,17 @@ def main() -> int:
     except urllib.error.HTTPError as e:
         rec(False, "GET /api/auth/me", str(e.code))
 
+    try:
+        st, d, _ = c.get("/api/control/my-reports")
+        rec(st == 200 and "items" in d, "GET /api/control/my-reports")
+    except urllib.error.HTTPError as e:
+        rec(False, "GET /api/control/my-reports", f"HTTP {e.code}")
+    try:
+        st, d, _ = c.get("/api/control/my-download?name=../secret.txt")
+        rec(st == 404, "个人报告下载拒绝路径穿越", f"HTTP {st}")
+    except urllib.error.HTTPError as e:
+        rec(e.code == 404, "个人报告下载拒绝路径穿越", f"HTTP {e.code}")
+
     # 未认证的边界：**写操作**必须被拒（只读看板是刻意公开的，见下方说明）
     anon = Client(B)
     for name, path, body in [

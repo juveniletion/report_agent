@@ -1844,6 +1844,8 @@ class GenerateIn(BaseModel):
     # 赛题 5.1.1：填 Word 模板时传模板文件名（仅月度）。
     # 空字符串 = 走默认 .md 模板，产出 markdown 后再导出 Word/PDF。
     template_docx: str = ""
+    # 个人成本汇总 MVP：显式启用个人数据；产物写个人工作区，不混共享。
+    use_personal: bool = False
 
 
 @app.get("/api/themes", summary="可选的分析主题")
@@ -1876,6 +1878,14 @@ def control_generate(body: GenerateIn,
     info = _whoami(authorization, lw_sid)
     if body.theme not in ("monthly", "quarterly", "topic"):
         raise HTTPException(400, f"未知分析主题：{body.theme}")
+
+    personal = bool(body.use_personal)
+    if personal and body.theme != "monthly":
+        raise HTTPException(400, "使用个人上传数据目前只支持月度分析")
+    ws = _ws(info["external_id"]) if personal else None
+    out_dir = (ws / "reports") if personal else REPORTS
+    if personal:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     # 赛题 5.1.1：填 Word 模板。模板本身是月度结构，故只在月度主题下开放。
     use_docx = bool(body.template_docx)
@@ -1914,22 +1924,34 @@ def control_generate(body: GenerateIn,
                and importlib.util.find_spec("langchain_openai") is not None)
     degraded = not has_llm
     try:
-        docx_out = (str(REPORTS / f"{body.product}_{body.month}.docx")
+        docx_out = (str(out_dir / f"{body.product}_{body.month}.docx")
                     if use_docx else None)
         r = RB.build(body.product, body.month, use_llm=has_llm, verbose=False,
                      theme=body.theme, period=body.period,
                      template_docx=str(tpl_path) if use_docx else None,
-                     docx_out_path=docx_out)
+                     docx_out_path=docx_out,
+                     use_personal=personal, personal_root=ws, out_dir=out_dir)
+    except ValueError as e:
+        if personal:
+            raise HTTPException(400, f"个人数据校验失败：{e}")
+        raise HTTPException(500, f"生成失败：{type(e).__name__}: {e}")
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"生成失败：{type(e).__name__}: {e}")
 
-    # Word 模板模式：产物是 reports/<产品>_<月>.docx，不再写 markdown。
+    scope = "personal" if personal else "shared"
+    sources = (r.get("stats") or {}).get("sources")
+    warnings = (r.get("stats") or {}).get("warnings") or []
+
+    # Word 模板模式：产物是 <out_dir>/<产品>_<月>.docx，不再写 markdown。
     if use_docx:
         docx_path = Path(r.get("docx") or "")
         if not docx_path.is_file():
             raise HTTPException(500, "Word 模板生成失败：未产出 docx")
+        if personal and not docx_path.resolve().is_relative_to(out_dir.resolve()):
+            raise HTTPException(500, "个人报告输出路径异常")
         return {"ok": True, "file": docx_path.name, "docx": True,
                 "template": tpl_path.name, "theme": body.theme,
+                "scope": scope, "sources": sources, "warnings": warnings,
                 "degraded": degraded,
                 "message": ("未配置模型 Key，已生成确定性数据版 Word"
                             "（AI 分析段落未生成）" if degraded else ""),
@@ -1946,10 +1968,11 @@ def control_generate(body: GenerateIn,
         else:
             text = "> " + note + "\n\n" + text
 
-    out = REPORTS / out_name
+    out = out_dir / out_name
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8", newline="\n")
     return {"ok": True, "file": out_name, "theme": body.theme,
+            "scope": scope, "sources": sources, "warnings": warnings,
             "degraded": degraded,
             "message": ("未配置模型 Key，已生成确定性数据版报告"
                         "（AI 分析段落未生成）" if degraded else ""),
@@ -1981,6 +2004,37 @@ def control_download(name: str,
     _whoami(authorization, lw_sid)
     p = REPORTS / Path(name).name
     if not p.is_file() or p.suffix.lower() not in (".docx", ".pdf"):
+        raise HTTPException(404, f"文件不存在：{name}")
+    return FileResponse(str(p), filename=p.name)
+
+
+@app.get("/api/control/my-reports", summary="我的个人报告")
+def control_my_reports(authorization: str = Header(default=""),
+                       lw_sid: str = Cookie(default="")) -> Dict[str, Any]:
+    """只列当前用户 ws/reports 下的 md/docx，不混共享 reports。"""
+    info = _whoami(authorization, lw_sid)
+    d = _ws(info["external_id"]) / "reports"
+    items = []
+    if d.exists():
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() in (".md", ".docx"):
+                items.append({"name": p.name, "stem": p.stem,
+                              "size": p.stat().st_size,
+                              "kind": p.suffix.lower().lstrip(".")})
+    return {"count": len(items), "items": items}
+
+
+@app.get("/api/control/my-download", summary="下载我的个人报告")
+def control_my_download(name: str,
+                        authorization: str = Header(default=""),
+                        lw_sid: str = Cookie(default="")) -> FileResponse:
+    """只允许当前用户 ws/reports 下的 md/docx。"""
+    info = _whoami(authorization, lw_sid)
+    base = (_ws(info["external_id"]) / "reports").resolve()
+    p = (base / Path(name).name).resolve()
+    if (not p.is_file()
+            or p.suffix.lower() not in (".md", ".docx")
+            or not p.is_relative_to(base)):
         raise HTTPException(404, f"文件不存在：{name}")
     return FileResponse(str(p), filename=p.name)
 
