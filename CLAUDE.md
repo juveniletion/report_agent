@@ -48,7 +48,7 @@ python scripts/forecast.py --product 银黄口服液 --horizon 1
 python scripts/period_agg.py --product 银黄口服液 --quarter 2026-Q2
 
 # Retrieval and agents
-python scripts/retrieval.py "查询" [--top 6] [--no-online] [--rebuild]
+python scripts/retrieval.py "查询" [--top 6] [--no-online] [--rebuild|--status]
 python scripts/router.py --selftest            # routing decisions only, no model call
 python scripts/router.py --ask "二厂单位成本"
 python scripts/agent_runtime.py -q "银黄口服液 5 月为什么涨？" --user demo
@@ -159,7 +159,7 @@ They share the filesystem (the same `wiki/`), not messages. `server/app.py` deci
 
 ### Retrieval, routing, frontend
 
-- `scripts/retrieval.py`: BM25 over character bigrams (CJK) + bge-m3 embeddings via SiliconFlow HTTP + RRF (`k=60`). Without a key/network it degrades to BM25. The vector index is built on demand into `.index/vectors.json`.
+- `scripts/retrieval.py`: BM25 over character bigrams (CJK) + **local ONNX embeddings** (`BAAI/bge-small-zh-v1.5`, 512-dim, via `fastembed`) + RRF (`k=60`). Set `EMBED_PROVIDER=siliconflow` to use `BAAI/bge-m3` over HTTP instead. The model is baked into the Docker image; the index is persisted in `.index/vectors.json` and mounted into the container. `/api/health.retrieval` and `/api/search.mode` report `hybrid` vs `BM25` so a silent degradation is visible.
 - `scripts/router.py`: deterministic three-tier ladder — library direct answer (0 tokens) → Qwen2.5-7B with output validation → deepseek-chat. Routing is a script, never an LLM judgment; small-model answers are checked for hallucinated numbers and false negatives, and escalate on failure.
 - `server/static/app.js` is the frontend logic: React 18 UMD + htm + ECharts, all vendored in `server/static/vendor/`; `styles.css` holds the RapidRF-inspired layout and `index.html` is a thin shell. There is no npm/build step; edit the files directly. Comments and user-facing strings are Chinese.
 
@@ -167,7 +167,7 @@ They share the filesystem (the same `wiki/`), not messages. `server/app.py` deci
 
 - `scripts/paths.py` resolves the data root in this order: `LLM_WIKI_DATA` → `/data` → repo `data/`. `LLM_WIKI_DB` is legacy and **does not affect resolution**.
 - `LLM_WIKI_WS` injects a workspace root (used by `ingest_tools`, `state`, `graph_build`, and personal uploads). The spec root (`SKILL.md`, `references/`) is always the code repo and must never come from user input.
-- Docker mounts `raw/ wiki/ state/ graph/` read-only and `reports/ exports/` writable, one directory at a time, because most scripts hardcode `WIKI_ROOT = HERE.parent`.
+- Docker mounts `raw/ wiki/ state/ graph/` read-only and `reports/ exports/ .index/` writable, one directory at a time, because most scripts hardcode `WIKI_ROOT = HERE.parent`. The `.index/` bind mount must be owned by the container user (`uid 10001`), which `deploy/post-receive` enforces.
 - Auth: server-side session + HttpOnly cookie, PBKDF2-SHA256 passwords, CSRF double-submit, one SQLite file per user (`data/users/<id>.db`) for physical isolation. Shared `wiki/`/`raw/` are read-only; writes go only to agent memory or the uploader's workspace. Reads merge the shared baseline with the user's workspace (`scripts/overlay.py`), with same-named personal files overriding shared ones — never the reverse. Set `LW_COOKIE_SECURE=1` in production so cookies carry `Secure`.
 - RPA: `server/mock_rpa.py` listens on internal port 8090 (not published). Tasks are parsed from section 6.4 of a report rather than regenerated; task IDs include the product code. If the mock is down, return `degraded: true` and persist locally — never report a fake success.
 

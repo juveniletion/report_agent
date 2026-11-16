@@ -116,12 +116,22 @@ def health() -> Dict[str, Any]:
         if not (p.suffix.lower() == ".txt"
                 and any(p.with_suffix(e).exists() for e in BINARY))
     ]
+    try:
+        import retrieval
+        rstatus = retrieval.vector_status(root=WIKI_ROOT)
+        err = retrieval.last_vector_error()
+        if err:
+            rstatus["last_error"] = err
+    except Exception as e:  # noqa: BLE001
+        rstatus = {"vector": False, "reason": f"{type(e).__name__}: {e}"}
+
     return {
         "ok": True,
         "articles": n_wiki,
         "sources": len(sources),          # 用户视角：多少份原始资料
         "raw_files": len(raw_files),
         "reports": len(list(REPORTS.glob("*.md"))) if REPORTS.exists() else 0,
+        "retrieval": rstatus,
     }
 
 
@@ -842,24 +852,31 @@ def search(q: str = Query(..., min_length=1), top_k: int = Query(6, ge=1, le=20)
 
     try:
         import retrieval
-        # 先确保索引覆盖当前语料（含个人层）。hybrid_search 内部也会查覆盖率，
-        # 这里显式建一次，让"个人块缺向量"在入口就被修掉。
-        idx = None
-        try:
-            idx = retrieval.build_index(verbose=False, root=WIKI_ROOT, **ov)
-        except Exception:  # noqa: BLE001
-            idx = None               # 离线/无 key 时退回只用 BM25
+        # hybrid_search 内部会检查覆盖率并按需重建；不再在入口先建一次，
+        # 避免重复 embedding。失败原因由 last_vector_error() 带回。
         hits = retrieval.hybrid_search(q, top_k=top_k, root=WIKI_ROOT,
-                                       index=idx, allow_online=idx is None, **ov)
+                                       allow_online=True, **ov)
+        vstatus = retrieval.vector_status(root=WIKI_ROOT)
+        hybrid = any(getattr(h, "vec_rank", None) is not None for h in hits)
+        if not hits:
+            hybrid = bool(vstatus.get("vector"))
         return {"query": q, "count": len(hits),
                 "scope": "shared+personal" if info else "shared",
+                "mode": "hybrid" if hybrid else "bm25",
+                "vector_error": retrieval.last_vector_error() or None,
                 "hits": [{"article": getattr(h.chunk, "article", ""),
                           "section": getattr(h.chunk, "section", ""),
                           "source": getattr(h.chunk, "source", "shared"),
                           "text": getattr(h.chunk, "text", "")[:400],
-                          "score": getattr(h, "rrf", None)} for h in hits]}
+                          "score": getattr(h, "rrf", None),
+                          "rrf": getattr(h, "rrf", None),
+                          "bm25_rank": getattr(h, "bm25_rank", None),
+                          "vec_rank": getattr(h, "vec_rank", None),
+                          "cosine": getattr(h, "cosine", None)} for h in hits]}
     except Exception as e:  # noqa: BLE001
-        return {"query": q, "count": 0, "hits": [], "error": f"{type(e).__name__}: {e}"}
+        return {"query": q, "count": 0, "hits": [], "mode": "bm25",
+                "vector_error": f"{type(e).__name__}: {e}",
+                "error": f"{type(e).__name__}: {e}"}
 
 
 # ---------------------------------------------------------------------------

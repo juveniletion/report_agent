@@ -161,6 +161,27 @@ def main() -> int:
             rec(False, f"GET {path.split('?')[0]}",
                 f"HTTP {e.code} {e.read().decode()[:90]}")
 
+    # ---- 3.1 检索：健康接口必须暴露混合/降级状态 ----
+    try:
+        st, h, _ = c.get("/api/health")
+        r = (h or {}).get("retrieval") or {}
+        rec(st == 200 and isinstance(r, dict) and "vector" in r,
+            "健康接口暴露检索状态",
+            f"vector={r.get('vector')} reason={r.get('reason')}")
+        q = urllib.parse.urlencode({"q": "金银花", "top_k": 3})
+        st, s, _ = c.get("/api/search?" + q)
+        rec(st == 200 and s.get("mode") in ("hybrid", "bm25"),
+            "检索接口返回混合/降级模式",
+            f"mode={s.get('mode')} count={s.get('count')}")
+        if r.get("vector"):
+            rec(s.get("mode") == "hybrid", "混合检索实际生效",
+                f"mode={s.get('mode')}")
+        else:
+            rec(True, "检索降级可见（未启用向量）",
+                f"reason={r.get('reason')}")
+    except urllib.error.HTTPError as e:
+        rec(False, "检索状态检查", f"HTTP {e.code} {e.read().decode()[:90]}")
+
     # exports 不应含 techspec（交付物文档不进站点）
     try:
         _, d, _ = c.get("/api/control/exports")

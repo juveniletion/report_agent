@@ -32,16 +32,20 @@ RRF 公式
 依赖
 ----
 - BM25：本文件纯 Python 实现（中文用字符 bigram，无需分词库）
-- 向量：SiliconFlow `BAAI/bge-m3`（1024 维），索引需预建（见 build_index.py）
+- 向量：默认本地 ONNX `BAAI/bge-small-zh-v1.5`（512 维，fastembed）；
+        可选 SiliconFlow `BAAI/bge-m3`（1024 维，HTTP）。
+        索引需预建（见 `build_index()` / `python scripts/retrieval.py --rebuild`）。
 """
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import math
 import os
 import re
 import sys
+import threading
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field, asdict
@@ -293,11 +297,8 @@ class BM25:
 
 
 # ===========================================================================
-# 三、向量检索（SiliconFlow bge-m3）
+# 三、向量检索（本地 ONNX / SiliconFlow）
 # ===========================================================================
-
-EMBED_MODEL = "BAAI/bge-m3"
-
 
 def _load_env() -> None:
     try:
@@ -311,29 +312,97 @@ def _load_env() -> None:
         pass
 
 
+# local     = fastembed + ONNX，默认 BAAI/bge-small-zh-v1.5（512 维，约 90MB，MIT）
+# siliconflow = HTTP bge-m3（1024 维，需要 SILICONFLOW_API_KEY）
+_MODEL_DIMS = {"BAAI/bge-small-zh-v1.5": 512, "BAAI/bge-m3": 1024}
+_LOCAL_MODEL = None
+_LOCAL_LOCK = threading.Lock()
+_LAST_VECTOR_ERROR = ""
+
+
+def embed_provider() -> str:
+    _load_env()
+    p = os.getenv("EMBED_PROVIDER", "local").strip().lower()
+    return p if p in ("local", "siliconflow") else "local"
+
+
+def embed_model_name(provider: Optional[str] = None) -> str:
+    _load_env()
+    p = provider or embed_provider()
+    if p == "siliconflow":
+        return os.getenv("SILICONFLOW_EMBED_MODEL", "BAAI/bge-m3").strip()
+    return os.getenv("EMBED_MODEL", "BAAI/bge-small-zh-v1.5").strip()
+
+
+def embedding_spec() -> Dict[str, Any]:
+    p = embed_provider()
+    m = embed_model_name(p)
+    return {"provider": p, "model": m, "dim": _MODEL_DIMS.get(m, 0)}
+
+
+def _set_vector_error(msg: str) -> None:
+    global _LAST_VECTOR_ERROR
+    _LAST_VECTOR_ERROR = str(msg or "")
+
+
+def last_vector_error() -> str:
+    return _LAST_VECTOR_ERROR
+
+
+def _local_model():
+    global _LOCAL_MODEL
+    if _LOCAL_MODEL is None:
+        from fastembed import TextEmbedding
+        name = embed_model_name("local")
+        cache = os.getenv("FASTEMBED_CACHE_PATH") or None
+        try:
+            _LOCAL_MODEL = TextEmbedding(model_name=name, cache_dir=cache)
+        except TypeError:  # 兼容不支持 cache_dir 参数的旧版 fastembed
+            _LOCAL_MODEL = TextEmbedding(model_name=name)
+    return _LOCAL_MODEL
+
+
 def embed_texts(texts: List[str], batch: int = 16, timeout: int = 40) -> List[List[float]]:
     """
-    调 SiliconFlow 计算 embedding。
-    批量提交以减少往返；失败时**抛异常而非静默返回零向量**（避免污染索引）。
+    计算 embedding：默认本地 ONNX，可选 SiliconFlow。
+
+    **失败时抛异常，不静默返回零向量**——否则索引会被污染。
     """
     _load_env()
+    if not texts:
+        return []
+
+    provider = embed_provider()
+    if provider == "local":
+        model = _local_model()
+        vectors: List[List[float]] = []
+        with _LOCAL_LOCK:
+            for i in range(0, len(texts), batch):
+                part = texts[i:i + batch]
+                for v in model.embed(part):
+                    vectors.append(v.tolist() if hasattr(v, "tolist") else list(v))
+        _set_vector_error("")
+        return vectors
+
     key = os.getenv("SILICONFLOW_API_KEY", "")
     url = os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1").rstrip("/")
     if not key:
         raise RuntimeError("未找到 SILICONFLOW_API_KEY")
+    model_name = embed_model_name("siliconflow")
 
-    vectors: List[List[float]] = []
+    vectors = []
     for i in range(0, len(texts), batch):
         part = texts[i:i + batch]
         req = urllib.request.Request(
             url + "/embeddings",
-            data=json.dumps({"model": EMBED_MODEL, "input": part}).encode("utf-8"),
+            data=json.dumps({"model": model_name, "input": part}).encode("utf-8"),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         items = sorted(data["data"], key=lambda d: d["index"])
         vectors.extend(it["embedding"] for it in items)
+    _set_vector_error("")
     return vectors
 
 
@@ -404,6 +473,22 @@ class Index:
         except Exception:  # noqa: BLE001
             return None
 
+    def matches_spec(self) -> bool:
+        """
+        索引是否与当前 provider/model/dim 匹配。
+
+        旧索引没有 provider/dim 字段，按历史默认（SiliconFlow bge-m3）处理；
+        切到本地模型时会被判为不匹配并自动重建，避免 1024 维与 512 维混用。
+        """
+        spec = embedding_spec()
+        provider = self.meta.get("provider", "siliconflow")
+        model = self.meta.get("model", "BAAI/bge-m3")
+        dim = self.meta.get("dim") or (
+            len(next(iter(self.vectors.values()))) if self.vectors else 0)
+        if provider != spec["provider"] or model != spec["model"]:
+            return False
+        return not spec["dim"] or not dim or spec["dim"] == dim
+
 
 def build_index(verbose: bool = True, root: Optional[Path] = None,
                 shared_root: Optional[Path] = None,
@@ -422,27 +507,30 @@ def build_index(verbose: bool = True, root: Optional[Path] = None,
     import hashlib
     r = Path(root) if root else WIKI_ROOT
     overlay_mode = shared_root is not None or personal_root is not None
+    spec = embedding_spec()
 
     chunks = load_chunks(**(
         {"shared_root": shared_root, "personal_root": personal_root}
         if overlay_mode else {"wiki_dir": r / "wiki"}))
     sig = hashlib.sha256(
-        "\n".join(f"{c.chunk_id}:{hashlib.md5(c.text.encode()).hexdigest()[:8]}"
-                  for c in chunks).encode()
+        (f"{spec['provider']}:{spec['model']}\n" +
+         "\n".join(f"{c.chunk_id}:{hashlib.md5(c.text.encode()).hexdigest()[:8]}"
+                   for c in chunks)).encode()
     ).hexdigest()[:16]
 
     old = Index.load(r)
-    if old and old.meta.get("signature") == sig:
+    if old and old.meta.get("signature") == sig and old.matches_spec():
         if verbose:
-            print(f"索引已是最新（{len(chunks)} 块，签名 {sig}），跳过重建")
+            print(f"索引已是最新（{len(chunks)} 块，{spec['provider']}/{spec['model']}，"
+                  f"签名 {sig}），跳过重建")
         return old
 
-    # ---- 向量复用：能查到旧向量的块不重算 ----
-    prev = dict(old.vectors) if old else {}
+    # ---- 向量复用：只复用**同一 provider/model** 的旧向量 ----
+    prev = dict(old.vectors) if old and old.matches_spec() else {}
     # 个人层还额外参考共享索引（那是最全的旧向量来源）
     if overlay_mode and shared_root is not None:
         sh = Index.load(Path(shared_root))
-        if sh:
+        if sh and sh.matches_spec():
             for k, v in sh.vectors.items():
                 prev.setdefault(k, v)
 
@@ -455,10 +543,12 @@ def build_index(verbose: bool = True, root: Optional[Path] = None,
     new_vecs = embed_texts([c.text for c in todo]) if todo else []
     vectors = dict(have)
     vectors.update({c.chunk_id: v for c, v in zip(todo, new_vecs)})
+    dim = len(next(iter(vectors.values()))) if vectors else spec["dim"]
 
     idx = Index(
         vectors=vectors,
-        meta={"model": EMBED_MODEL, "signature": sig, "count": len(chunks),
+        meta={"provider": spec["provider"], "model": spec["model"], "dim": dim,
+              "signature": sig, "count": len(chunks),
               "reused": len(have), "computed": len(todo),
               "overlay": bool(overlay_mode),
               "built_at": __import__("datetime").datetime.now().isoformat(timespec="seconds")},
@@ -468,6 +558,54 @@ def build_index(verbose: bool = True, root: Optional[Path] = None,
     if verbose:
         print(f"索引已保存：{idx.path()}（{len(vectors)} 向量）")
     return idx
+
+
+def vector_status(root: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    面向 `/api/health` 的索引状态：**不加载模型、不联网**，只查文件和覆盖度。
+    `vector=False` 时给出可读原因，避免"看起来是混合检索、实际只跑 BM25"。
+    """
+    _load_env()
+    r = Path(root) if root else WIKI_ROOT
+    spec = embedding_spec()
+    out: Dict[str, Any] = {**spec, "vector": False, "reason": ""}
+
+    if spec["provider"] == "siliconflow" and not os.getenv("SILICONFLOW_API_KEY", "").strip():
+        out["reason"] = "siliconflow_key_missing"
+        return out
+    if spec["provider"] == "local" and importlib.util.find_spec("fastembed") is None:
+        out["reason"] = "fastembed_not_installed"
+        return out
+
+    idx = Index.load(r)
+    if idx is None:
+        out["reason"] = "index_missing"
+        return out
+    if not idx.matches_spec():
+        out.update({
+            "reason": "index_spec_mismatch",
+            "index_provider": idx.meta.get("provider", "siliconflow"),
+            "index_model": idx.meta.get("model", "BAAI/bge-m3"),
+            "index_dim": idx.meta.get("dim"),
+        })
+        return out
+
+    try:
+        chunks = load_chunks(wiki_dir=r / "wiki")
+    except Exception as e:  # noqa: BLE001
+        out["reason"] = f"chunks_unreadable:{type(e).__name__}"
+        return out
+
+    missing = sum(1 for c in chunks if c.chunk_id not in idx.vectors)
+    ok = bool(idx.vectors) and missing == 0
+    out.update({
+        "dim": idx.meta.get("dim") or spec["dim"],
+        "chunks": len(chunks),
+        "built_at": idx.meta.get("built_at"),
+        "vector": ok,
+        "reason": "ok" if ok else f"index_incomplete:{missing}",
+    })
+    return out
 
 
 # ===========================================================================
@@ -543,6 +681,13 @@ def hybrid_search(
     vec_rank: List[int] = []
     cos_by_idx: Dict[int, float] = {}
     idx = index if index is not None else Index.load(r)
+
+    # 索引存在但 provider/model/dim 与当前配置不符（例如 bge-m3 1024 维
+    # 切到本地 bge-small-zh 512 维）→ 视为不可用，触发重建。
+    if idx is not None and not idx.matches_spec():
+        _set_vector_error("index_spec_mismatch")
+        idx = None
+
     # ⚠️ 光看"索引存在"不够——**必须确认它覆盖了当前语料**。
     #    实测踩到：索引建在改动之前，个人块没有向量。
     #    此时该块只在 BM25 排名里、不在向量排名里，
@@ -558,11 +703,13 @@ def hybrid_search(
                                       **({"shared_root": shared_root,
                                           "personal_root": personal_root}
                                          if overlay_mode else {}))
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    _set_vector_error(f"{type(e).__name__}: {e}")
                     idx = None
             else:
                 # 离线且索引不全 → 宁可不用向量，也别用半份索引：
                 # BM25 单独跑仍能命中，混着半份向量反而会压制新内容。
+                _set_vector_error("offline_index_incomplete")
                 idx = None
     if idx is None and allow_online:
         try:
@@ -570,8 +717,11 @@ def hybrid_search(
                               **({"shared_root": shared_root,
                                   "personal_root": personal_root}
                                  if overlay_mode else {}))
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            _set_vector_error(f"{type(e).__name__}: {e}")
             idx = None
+    elif idx is None and not allow_online:
+        _set_vector_error("offline_index_missing")
     if idx:
         try:
             qv = embed_texts([query])[0]
@@ -585,7 +735,9 @@ def hybrid_search(
                 sims.append((i, s))
             sims.sort(key=lambda x: -x[1])
             vec_rank = [i for i, _ in sims]
-        except Exception:  # noqa: BLE001
+            _set_vector_error("")
+        except Exception as e:  # noqa: BLE001
+            _set_vector_error(f"{type(e).__name__}: {e}")
             vec_rank = []
 
     # --- RRF 融合 ---
@@ -622,7 +774,7 @@ def format_hits(hits: List[Hit], max_chars: int = 700,
     """
     if not hits:
         return "未检索到相关内容。请尝试更换关键词，或用 list_wiki_articles 浏览全库。"
-    out: List[str] = [f"混合检索命中 {len(hits)} 节（按 RRF 排序）：\n"]
+    out: List[str] = [f"检索命中 {len(hits)} 节（按 RRF 排序）：\n"]
     for n, h in enumerate(hits, 1):
         c = h.chunk
         src = f"bm25#{h.bm25_rank}" if h.bm25_rank else "bm25—"
@@ -654,10 +806,16 @@ if __name__ == "__main__":
     ap.add_argument("--top", type=int, default=6)
     ap.add_argument("--no-online", action="store_true", help="只用已落盘索引")
     ap.add_argument("--rebuild", action="store_true", help="强制重建索引")
+    ap.add_argument("--status", action="store_true", help="打印向量索引状态")
     a = ap.parse_args()
 
     if a.rebuild:
+        print(json.dumps(vector_status(), ensure_ascii=False, indent=2))
         build_index()
+        print(json.dumps(vector_status(), ensure_ascii=False, indent=2))
+        sys.exit(0)
+    if a.status:
+        print(json.dumps(vector_status(), ensure_ascii=False, indent=2))
         sys.exit(0)
     q = " ".join(a.query)
     if not q:
