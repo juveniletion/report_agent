@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# =============================================================================
+# 服务器端 post-receive 钩子：仅 main 更新时自动部署
+#
+# 安装位置：/opt/pharma-cost-wiki.git/hooks/post-receive
+# 日志：/var/log/pharma-deploy.log
+#
+# 设计边界：
+#   · 只检出代码，**绝不** git clean —— .env / raw / wiki / state / graph /
+#     reports / exports / data 都是未跟踪数据，不能被部署脚本删掉。
+#   · 其他分支只进 bare 仓库，不触发构建。
+#   · 构建失败时旧容器仍在运行；健康检查失败时保留 deploy-prev 回滚点。
+#   · 不在服务器保存任何私钥；推送用的是本地私钥，服务器只收 git 对象。
+# =============================================================================
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+BARE=/opt/pharma-cost-wiki.git
+WORK=/opt/pharma-cost-wiki
+BRANCH=main
+LOG=/var/log/pharma-deploy.log
+ZERO=0000000000000000000000000000000000000000
+
+exec >>"$LOG" 2>&1
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+
+deploy=0
+PREV=""
+NEW=""
+while read -r old new ref; do
+  [ "$ref" = "refs/heads/$BRANCH" ] || continue
+  [ "$new" = "$ZERO" ] && continue
+  deploy=1
+  PREV="$old"
+  NEW="$new"
+done
+
+[ "$deploy" = 1 ] || exit 0
+
+log "=== deploy start ${PREV:0:10} -> ${NEW:0:10} ==="
+
+# 记录回滚点。首次推送 main 时 old 是全 0，退回 server-baseline。
+if [ "${PREV:-$ZERO}" = "$ZERO" ]; then
+  PREV=$(git --git-dir="$BARE" rev-parse --verify server-baseline 2>/dev/null || true)
+fi
+if [ -n "${PREV:-}" ]; then
+  git --git-dir="$BARE" branch -f deploy-prev "$PREV" 2>/dev/null || true
+  log "rollback point: deploy-prev -> $PREV"
+fi
+
+# 串行化，避免两个 push 同时构建
+exec 9>/tmp/pharma-deploy.lock
+if ! flock -n 9; then
+  log "another deploy is running; abort"
+  exit 1
+fi
+
+# 安全兜底：私钥若出现在 main 中，拒绝部署
+# 只匹配真正的 PEM 头；排除检查脚本自身，避免自匹配
+if git --git-dir="$BARE" grep -I -l -E '^-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----' \
+     "refs/heads/$BRANCH" -- . ':(exclude)deploy/ship.sh' ':(exclude)deploy/post-receive' >/dev/null 2>&1; then
+  log "SECURITY: private key material found in $BRANCH; abort"
+  exit 1
+fi
+
+cd "$WORK" || { log "worktree missing: $WORK"; exit 1; }
+
+if [ -e "$WORK/id_ed25519" ] || [ -e "$WORK/id_ed25519.pub" ]; then
+  log "SECURITY: private key file found in worktree; abort"
+  exit 1
+fi
+
+export GIT_DIR="$BARE" GIT_WORK_TREE="$WORK"
+if ! git checkout -f "$BRANCH"; then
+  log "checkout failed"
+  unset GIT_DIR GIT_WORK_TREE
+  exit 1
+fi
+unset GIT_DIR GIT_WORK_TREE
+
+# 服务器专属：重放国内镜像源（checkout -f 会还原成仓库版本）
+if ! grep -q "mirrors.aliyun.com/pypi" Dockerfile; then
+  sed -i 's|RUN pip install --no-cache-dir -r requirements.txt|RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.txt|' Dockerfile
+fi
+if [ -f server/Dockerfile.mock ] && ! grep -q "mirrors.aliyun.com/pypi" server/Dockerfile.mock; then
+  sed -i 's|RUN pip install --no-cache-dir -r requirements-mock.txt|RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r requirements-mock.txt|' server/Dockerfile.mock
+fi
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("Dockerfile")
+s = p.read_text()
+needle = "RUN apt-get update && apt-get install -y --no-install-recommends"
+repl = 'RUN sed -i "s/deb.debian.org/mirrors.aliyun.com/g" /etc/apt/sources.list.d/debian.sources && apt-get update && apt-get install -y --no-install-recommends'
+if needle in s:
+    p.write_text(s.replace(needle, repl))
+PY
+
+log "docker compose up -d --build"
+if ! docker compose up -d --build; then
+  log "build/up failed; old container should still be running"
+  log "rollback: cd $WORK && GIT_DIR=$BARE GIT_WORK_TREE=$WORK git checkout -f deploy-prev && docker compose up -d --build"
+  exit 1
+fi
+
+# 最多等约 2 分钟
+for _ in $(seq 1 60); do
+  if curl -fsS --max-time 3 http://127.0.0.1:8765/api/health >/dev/null 2>&1; then
+    log "deploy ok"
+    exit 0
+  fi
+  sleep 2
+done
+
+log "health check failed"
+log "rollback: cd $WORK && GIT_DIR=$BARE GIT_WORK_TREE=$WORK git checkout -f deploy-prev && docker compose up -d --build"
+exit 1

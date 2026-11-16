@@ -14,14 +14,36 @@ data/
 raw/
 
 # ---- 由数据派生、同样含数据的中间层 ----
-wiki/          # 知识编译层：正文大量复述配方/工艺/GMP 原文
-state/         # 关键数值快照（来自成本 CSV）
-graph/         # 知识图谱派生视图
-reports/       # 已生成报告（含具体成本数字）
-exports/       # Word/PDF 产物（含图与数字）
+# ⚠️ .gitignore 不支持行内注释：`wiki/  # 说明` 会被当成一个完整模式，
+#    结果这五条规则实际全部失效。注释必须单独成行。
+# wiki/ 是知识编译层：正文大量复述配方/工艺/GMP 原文
+wiki/
+# state/ 是关键数值快照（来自成本 CSV）
+state/
+# graph/ 是知识图谱派生视图
+graph/
+# reports/ 是已生成报告（含具体成本数字）
+reports/
+# exports/ 是 Word/PDF 产物（含图与数字）
+exports/
 *.db
 users/
 shared/
+
+# ---- 检索索引与投放区（派生 / 含赛题数据）----
+.index/
+inbox/
+
+# ---- 本地生成物与交付包（含赛题数据或大文件，不入库）----
+_ppt_master_projects/
+_ppt_master_src/
+_pre_rebuild/
+briefs*.json
+创灵境_*/
+创灵境_*.zip
+基于llm-wiki的智能分析面板_*/
+基于llm-wiki的智能分析面板_*.zip
+*.zip
 
 # ---- references/ 是逐文件跟踪的，新文件不会被上面几条挡住 ----
 # 评测报告正文全是赛题数据的复算结果（单位成本、差异率、任务标题里的涨幅），
@@ -50,6 +72,9 @@ references/评测报告.md
 !.env.example
 *.key
 *.pem
+# 云服务器 SSH 私钥：只留在本地，绝不入库、绝不进 Docker 构建上下文
+id_ed25519
+id_ed25519.pub
 
 # =============================================================================
 # Python 构建产物
