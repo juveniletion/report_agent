@@ -89,6 +89,10 @@ services:
       - ${WIKI_DATA_DIR:-.}/state:/app/state:ro
       - ${WIKI_DATA_DIR:-.}/graph:/app/graph:ro
 
+      # ---- 向量索引：派生缓存，挂出来避免每次重建都重新 embedding ----
+      # 容器用户是 uid 10001；宿主机需 chown 10001:10001 .index（部署钩子会做）。
+      - ${WIKI_DATA_DIR:-.}/.index:/app/.index
+
       # ---- 输出：可写挂载（否则生成的报告只在容器里，宿主机看不见）----
       - ${WIKI_DATA_DIR:-.}/reports:/app/reports
       - ${WIKI_DATA_DIR:-.}/exports:/app/exports

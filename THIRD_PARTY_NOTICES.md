@@ -46,7 +46,22 @@ LLM 客户端为 `langchain-openai`（OpenAI 兼容协议）。这也是赛题
 | pandas | 3.0.2 | **BSD-3-Clause** |
 | numpy | 2.4.4 | **BSD-3-Clause** |
 
-### ⚠️ 1.3 需特别说明的依赖：PyMuPDF
+### 1.3 检索 embedding（本地 ONNX）
+
+混合检索的语义侧默认使用本地 ONNX 模型，不依赖外部 API：
+
+| 组件 | 版本 | 许可证 | 说明 |
+|:---|:---|:---|:---|
+| `fastembed` | 0.9.1 | **Apache-2.0** | ONNX 推理封装；传递依赖含 `onnxruntime` / `tokenizers` / `huggingface_hub` 等，按各自许可证 |
+| `onnxruntime` | 1.32.x | **MIT** | CPU 推理运行时 |
+| `BAAI/bge-small-zh-v1.5`（FastEmbed ONNX 版 `Qdrant/bge-small-zh-v1.5`） | — | **MIT** | 512 维中文 embedding 模型；ONNX 权重约 90MB，在 Docker 构建时下载并烘进镜像，**不进入 Git 仓库** |
+
+- 模型页面：<https://huggingface.co/BAAI/bge-small-zh-v1.5>
+- FastEmbed 支持列表：<https://qdrant.github.io/fastembed/examples/Supported_Models/>
+- 使用方法：`scripts/retrieval.py` 的 `embed_texts()`；设 `EMBED_PROVIDER=siliconflow`
+  可切回 SiliconFlow 的 `BAAI/bge-m3`（1024 维，HTTP）。
+
+### ⚠️ 1.4 需特别说明的依赖：PyMuPDF
 
 | 组件 | 版本 | 许可证 |
 |:---|:---|:---|

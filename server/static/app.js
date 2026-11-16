@@ -142,7 +142,13 @@ function HeroStat({ label, value, unit, index }) {
 function HeroStats({ health, notes }) {
   const items = [
     { label: "COVERED PRODUCTS", value: 3, unit: "个" },
-    { label: "ANALYSIS WINDOW", value: 6, unit: "个月" },
+    {
+      label: "RETRIEVAL",
+      value: health && health.retrieval
+        ? (health.retrieval.vector ? "混合" : "BM25")
+        : "—",
+      unit: "",
+    },
     { label: "SOURCE DOCUMENTS", value: health ? health.sources : "—", unit: "份" },
     { label: "DATA NOTES", value: notes ? notes.count : 0, unit: "条" },
   ];

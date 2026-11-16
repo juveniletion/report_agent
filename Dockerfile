@@ -66,6 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         -o Acquire::https::Timeout=90 \
         fonts-noto-cjk \
         pandoc \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- 层 2：LaTeX（大，~1GB，最易抖的就是它）----
@@ -109,6 +110,18 @@ RUN mkdir -p raw wiki state reports graph exports
 
 # ---- 记忆卷 + 运行用户 ----
 RUN mkdir -p /data && useradd -m -u 10001 wiki && chown -R wiki:wiki /app /data
+
+# ---- 本地 embedding 模型（ONNX，烘进镜像，运行期离线）----
+# bge-small-zh-v1.5: 512 维、约 90MB、MIT。构建时从国内镜像下载一次；
+# 运行期不再联网，也不会把文档发给第三方。
+ENV HF_ENDPOINT=https://hf-mirror.com \
+    FASTEMBED_CACHE_PATH=/opt/fastembed \
+    EMBED_PROVIDER=local \
+    EMBED_MODEL=BAAI/bge-small-zh-v1.5
+RUN mkdir -p /opt/fastembed && \
+    python -c "from fastembed import TextEmbedding; m=TextEmbedding(model_name='BAAI/bge-small-zh-v1.5', cache_dir='/opt/fastembed'); list(m.embed(['初始化']))" && \
+    chown -R wiki:wiki /opt/fastembed
+
 USER wiki
 
 EXPOSE 8765

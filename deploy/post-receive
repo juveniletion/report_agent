@@ -96,6 +96,10 @@ if needle in s:
     p.write_text(s.replace(needle, repl))
 PY
 
+# 向量索引目录（挂载进容器；容器用户 uid 10001 必须可写）
+mkdir -p "$WORK/.index"
+chown 10001:10001 "$WORK/.index" 2>/dev/null || true
+
 log "docker compose up -d --build"
 if ! docker compose up -d --build; then
   log "build/up failed; old container should still be running"
@@ -106,6 +110,10 @@ fi
 # 最多等约 2 分钟
 for _ in $(seq 1 60); do
   if curl -fsS --max-time 3 http://127.0.0.1:8765/api/health >/dev/null 2>&1; then
+    # 非阻断：按需重建向量索引（已有且签名一致时会跳过）
+    if ! docker compose exec -T wiki-dashboard python scripts/retrieval.py --rebuild; then
+      log "WARN: vector index rebuild failed; search will fall back to BM25"
+    fi
     log "deploy ok"
     exit 0
   fi
