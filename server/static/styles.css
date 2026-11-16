@@ -515,6 +515,39 @@ select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px
   text-align: center; color: var(--faint); font-size: 12.5px;
   margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--line);
 }
+.foot a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.foot a:hover { color: var(--ink); }
+
+/* ---- 报告生成 / 多模型路由的小控件 ---- */
+.word-opt, .route-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12.5px; color: var(--muted, #6b7280);
+  cursor: pointer; user-select: none;
+}
+.word-opt input, .route-toggle input { accent-color: var(--accent, #0b6b5b); }
+.route-toggle-row {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+  margin: 8px 0 0 2px;
+}
+.route-hint { font-size: 12px; color: var(--faint); }
+.route-line {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin: 0 0 10px;
+}
+.route-badge {
+  font-size: 12px; padding: 2px 9px; border-radius: 999px;
+  background: #e8f3f0; color: #0b6b5b;
+}
+.route-badge.small { background: #fef3c7; color: #92400e; }
+.route-badge.large { background: #ede9fe; color: #5b21b6; }
+.route-badge.unavailable { background: #fee2e2; color: #991b1b; }
+.route-note { font-size: 12px; color: var(--faint); }
+.route-trace { font-size: 12px; color: var(--faint); }
+.route-trace summary { cursor: pointer; }
+.route-trace pre {
+  white-space: pre-wrap; margin: 6px 0 0; max-width: 680px;
+  font-family: inherit; line-height: 1.5;
+}
 
 /* ---- 窄屏 ---- */
 @media (max-width: 640px) {

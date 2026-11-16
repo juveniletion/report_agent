@@ -166,6 +166,9 @@ def list_raw_files(topic: str = "") -> str:
     return f"raw/ 共 {len(files)} 个文件:\n" + "\n".join(files)
 
 
+_GREP_COUNTS: dict = {}
+
+
 @tool
 def grep_raw(pattern: str, path: str = "") -> str:
     """
@@ -177,6 +180,16 @@ def grep_raw(pattern: str, path: str = "") -> str:
     :param pattern: 要检索的字面量或正则（如 '141.0'、'提取收率'）
     :param path: 可选，限定某个 raw 文件（相对 wiki 根的路径）
     """
+    # 检索硬停止：同一 pattern 第 3 次调用直接返回停止指令。
+    # 实测 flash 模型会在查不到的数值上反复 grep（最多见过 151 次），
+    # 只靠提示词里的“最多查 3 次”约束不住，必须在工具层拦截。
+    key = pattern.strip()
+    _GREP_COUNTS[key] = _GREP_COUNTS.get(key, 0) + 1
+    if _GREP_COUNTS[key] > 2:
+        return (f"❌ 同一 pattern 已查询 2 次，停止检索：`{pattern}`\n"
+                f"   → 按 SKILL.md：查不到就删除精确值或用不含精度的方式陈述；\n"
+                f"     有冲突就写 `Status: Disputed`。\n"
+                f"   → 现在请继续写词条，不要再调用 grep_raw 查这个 pattern。")
     target = _safe(path) if path else RAW_DIR
     if not target.exists():
         return f"文件不存在: {path}"
