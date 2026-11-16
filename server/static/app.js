@@ -2847,107 +2847,119 @@ function HomeForecast() {
     ? data.expected_unit_cost - last.单位成本 : null;
   const pct = chg != null && last.单位成本
     ? chg / last.单位成本 * 100 : null;
+
+  const hist = (data.history || []).filter(h => h.单位成本 != null);
+  const lineRows = hist.map((h, i) => ({
+    月份: h.月份,
+    单位成本: h.单位成本,
+    预测值: i === hist.length - 1 ? h.单位成本 : null,
+  }));
+  lineRows.push({
+    月份: data.forecast_month,
+    单位成本: null,
+    预测值: data.expected_unit_cost,
+  });
+  const lineColors = [
+    { key: "单位成本", label: "历史实绩", color: "#0F766E" },
+    { key: "预测值", label: "下月预测", color: "#F59E0B" },
+  ];
+
   const components = [
     { key: "material", label: "直接材料", color: "#0F766E" },
     { key: "labor", label: "直接人工", color: "#F59E0B" },
     { key: "overhead", label: "制造费用", color: "#6366F1" },
   ].map(c => ({ ...c, value: (data.component_expectations || {})[c.key] }));
-  const compTotal = components.reduce((s, c) => s + (c.value || 0), 0);
+  const compItems = components.map(c => ({ name: c.label, value: c.value, color: c.color }));
+
+  const scenarios = data.scenarios || [];
+  const scenarioItems = scenarios.map((s, i) => ({
+    label: `${s.from_month.slice(5)}→${s.to_month.slice(5)}`,
+    value: s.unit_cost,
+    color: i === scenarios.length - 1 ? "#F59E0B" : "#0F766E",
+  }));
 
   return html`
     <section class="home-sec">
-      <div class="card fc-card">
-        <h2>成本趋势预测
-          <span class="fc-tag">外推</span>
-          <span class="hint">${data.method}　·　${data.as_of} → ${data.forecast_month}　·　样本 ${data.n_samples} 个点</span>
+      <div class="sec-head">
+        <h2 class="sec-title">成本趋势预测
+          <span class="sec-hint">历史情景法 · 下月外推</span>
         </h2>
-        <p class="card-sub">
-          基于历史月度成本与材料行情的<strong>联合情景</strong>预测下月单位成本。
-          这里的数字<strong>不是已发生的数</strong>，也没有 raw 坐标；
-          区间是历史情景的最低~最高范围，<strong>不是统计置信区间</strong>。
-          当前只使用共享基线，个人成本汇总不参与预测。
-        </p>
-
-        <div class="toolbar" style=${{ marginBottom: 16 }}>
-          <label>产品</label>
+        <div class="toolbar">
           <select value=${product} onChange=${e => setProduct(e.target.value)}>
             ${((prod && prod.products) || []).map(p => html`
               <option key=${p} value=${p}>${p}</option>`)}
           </select>
+          <span class="pill">共享基线</span>
         </div>
+      </div>
 
-        <table class="tbl">
-          <thead><tr>
-            <th>月份</th><th class="num">单位成本（元/盒）</th>
-            <th class="num">情景范围</th><th>相对上月实际</th>
-          </tr></thead>
-          <tbody>
-            ${last ? html`
-              <tr>
-                <td>${last.月份}<span class="hint">（实际）</span></td>
-                <td class="num">${fmt(last.单位成本)}</td>
-                <td class="num">—</td><td>—</td>
-              </tr>` : null}
-            <tr>
-              <td>${data.forecast_month}</td>
-              <td class="num strong">${fmt(data.expected_unit_cost)}</td>
-              <td class="num">${fmt(range.lower)} ~ ${fmt(range.upper)}</td>
-              <td class=${cls(chg)}>
+      <div class="chart2">
+        <div class="card fc-card">
+          <h3>历史实绩与下月预测</h3>
+          <p class="card-sub">
+            ${data.method}${data.weighting ? " · " + data.weighting : ""}
+          </p>
+          <div style=${{ display: "flex", flexWrap: "wrap", gap: 24,
+                          alignItems: "flex-end", marginBottom: 14 }}>
+            <div>
+              <div class="hint">下月期望</div>
+              <div style=${{ font: "700 30px/1.1 var(--mono)", color: "var(--ink)",
+                              letterSpacing: "-1px" }}>
+                ${fmt(data.expected_unit_cost)}
+                <span style=${{ fontSize: 12, fontWeight: 400, color: "var(--muted)",
+                                marginLeft: 4 }}>元/盒</span>
+              </div>
+            </div>
+            <div>
+              <div class="hint">情景范围</div>
+              <div style=${{ font: "600 18px/1.5 var(--mono)", color: "var(--ink)" }}>
+                ${fmt(range.lower)} ~ ${fmt(range.upper)}
+              </div>
+            </div>
+            <div>
+              <div class="hint">相对 ${data.as_of}</div>
+              <div class=${cls(chg)} style=${{ fontSize: 18, fontWeight: 650 }}>
                 ${chg != null && pct != null
                   ? `${ARROW(chg)} ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`
                   : "—"}
-              </td>
-            </tr>
-          </tbody>
-        </table>
+              </div>
+            </div>
+            <div>
+              <div class="hint">历史样本</div>
+              <div style=${{ fontSize: 15, fontWeight: 600, color: "var(--ink)" }}>
+                ${data.n_samples} 个月
+              </div>
+            </div>
+          </div>
+          <${LineChart} series=${lineRows} colors=${lineColors} height=${300}
+             title=${`单位成本-${data.as_of}-${data.forecast_month}`} />
+        </div>
 
-        <h3 class="ws-h" style=${{ marginTop: 18 }}>下月成本构成期望</h3>
-        <table class="tbl">
-          <thead><tr><th>成本要素</th><th class="num">期望值（元/盒）</th><th class="num">占比</th></tr></thead>
-          <tbody>
-            ${components.map(c => html`
-              <tr key=${c.key}>
-                <td><i style=${{ display: "inline-block", width: 9, height: 9,
-                                 borderRadius: 2, background: c.color,
-                                 marginRight: 6 }}></i>${c.label}</td>
-                <td class="num">${fmt(c.value)}</td>
-                <td class="num">${compTotal ? fmt(c.value / compTotal * 100, 1) + "%" : "—"}</td>
-              </tr>`)}
-          </tbody>
-        </table>
-
-        <details class="wsbox" style=${{ marginTop: 14 }}>
-          <summary>查看 ${(data.scenarios || []).length} 个历史情景
-            <span class="hint">等权；不是概率预测</span></summary>
-          <table class="tbl" style=${{ marginTop: 10 }}>
-            <thead><tr>
-              <th>情景</th><th class="num">权重</th>
-              <th class="num">材料</th><th class="num">人工</th>
-              <th class="num">制造费用</th><th class="num">单位成本</th>
-            </tr></thead>
-            <tbody>
-              ${(data.scenarios || []).map((s, i) => html`
-                <tr key=${i}>
-                  <td>${s.from_month} → ${s.to_month}</td>
-                  <td class="num">${(s.probability * 100).toFixed(0)}%</td>
-                  <td class="num">${fmt(s.material)}</td>
-                  <td class="num">${fmt(s.labor)}</td>
-                  <td class="num">${fmt(s.overhead)}</td>
-                  <td class="num strong">${fmt(s.unit_cost)}</td>
-                </tr>`)}
-            </tbody>
-          </table>
-        </details>
-
-        ${(data.warnings || []).length ? html`
-          <div class="fc-warn">
-            ${data.warnings.map((w, i) => html`<div key=${i}>⚠️ ${w}</div>`)}
-          </div>` : null}
+        <div class="card">
+          <h3>下月成本构成期望</h3>
+          <p class="card-sub">按近期加权历史情景计算的材料、人工与制造费用。</p>
+          <${DonutChart} items=${compItems} total=${data.expected_unit_cost}
+             unit="元/盒" height=${300}
+             title=${`下月成本构成-${data.forecast_month}`} />
+        </div>
       </div>
+
+      <div class="card">
+        <h3>5 个历史情景对比</h3>
+        <p class="card-sub">
+          每个情景把当期原料行情、工时效率与产量摊薄联合应用；
+          越接近当前月的情景权重越高，最后一根是最近情景。
+        </p>
+        <${BarChart} items=${scenarioItems} height=${260}
+          title=${`历史情景-${product}`} />
+      </div>
+
+      <p class="sec-foot">
+        预测为外推，没有 raw 坐标；情景范围是 5 个历史情景的最低~最高，
+        不是统计置信区间。当前使用共享基线，个人成本汇总不参与预测。
+      </p>
     </section>`;
 }
-
-
 function HomeHeatmap() {
   const { data, loading, error } = useApi("/api/heatmap");
   const [el, setEl] = useState("单位材料");

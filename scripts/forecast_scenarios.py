@@ -4,6 +4,7 @@
 #
 # 注意：这是**外推**，预测值没有 raw 坐标；区间是历史情景的最小/最大范围，
 # 不是统计置信区间。只用于首页预测卡片，不写入 6 章报告正文。
+# 情景按近期加权（RECENCY_DECAY=0.8），不是等权；越接近当前月权重越高。
 """Estimate next month's unit cost from joint historical monthly scenarios."""
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ from console_io import ensure_utf8_stdout
 BASELINE_MONTHS = 3
 MAX_SCENARIOS = 5
 MIN_HISTORY_MONTHS = 4
+# 近期情景权重更高：越接近当前月的情景权重越大。
+# 0.8 是温和衰减：5 个情景权重约 12%/15%/19%/24%/30%，避免被单月噪声主导。
+RECENCY_DECAY = 0.8
 RAW_CSV = Path(__file__).resolve().parent.parent / "raw" / "csv"
 
 
@@ -117,12 +121,16 @@ def forecast(
     cost_dir: Path = RAW_CSV / "cost_data",
     market_dir: Path = RAW_CSV / "market_data",
     as_of: str | None = None,
+    decay: float = RECENCY_DECAY,
 ) -> dict:
-    """Return a one-month forecast from equal-weight, joint historical scenarios.
+    """Return a one-month forecast from joint historical scenarios.
 
+    Scenarios are recency-weighted (``decay``), not equal-weighted.
     The optional as_of month is the last available actual month in a backtest.
     The range is the minimum and maximum of the scenario totals.
     """
+    if not 0 < decay <= 1:
+        raise ValueError("decay 必须在 (0, 1] 之间。")
     product = product.strip()
     cost = _unique_rows(
         _product_rows(cost_dir, "中药一厂_成本汇总_*.csv", product), "成本汇总"
@@ -185,7 +193,6 @@ def forecast(
     if fixed_baseline > overhead_baseline:
         raise ValueError("基准折旧高于制造费用合计。")
 
-    weight = 1 / len(volume_factors)
     scenarios = []
     for i, (previous, current) in enumerate(zip(months, months[1:])):
         material = sum(
@@ -197,17 +204,26 @@ def forecast(
         scenarios.append({
             "from_month": _month_label(previous),
             "to_month": _month_label(current),
-            "probability": weight,
             "material": material,
             "labor": labor_cost,
             "overhead": overhead,
             "unit_cost": material + labor_cost + overhead,
         })
 
+    # 近期情景权重更高：最早的权重最小，最近一期最大。
+    n = len(scenarios)
+    raw_weights = [decay ** (n - 1 - i) for i in range(n)]
+    total_weight = sum(raw_weights)
+    weights = [w / total_weight for w in raw_weights]
+    for scenario, weight in zip(scenarios, weights):
+        scenario["probability"] = weight
+
     totals = [scenario["unit_cost"] for scenario in scenarios]
     cutoff = months[-1]
     next_month = (cutoff.replace(day=28) + timedelta(days=4)).replace(day=1)
-    warnings = [f"历史情景范围来自 {len(scenarios)} 个等权情景，仅供趋势参考。"]
+    warnings = [
+        f"历史情景范围来自 {n} 个近期加权情景（decay={decay:.2f}），仅供趋势参考。"
+    ]
     unpriced = sorted(set(names) - price_factors.keys())
     if unpriced:
         warnings.append("以下材料缺少完整行情，沿用基准成本：" + "、".join(unpriced))
@@ -216,14 +232,22 @@ def forecast(
         "product": product,
         "as_of": _month_label(cutoff),
         "forecast_month": _month_label(next_month),
-        "expected_unit_cost": mean(totals),
+        "expected_unit_cost": sum(
+            scenario["unit_cost"] * weight
+            for scenario, weight in zip(scenarios, weights)
+        ),
         "component_expectations": {
-            part: mean(scenario[part] for scenario in scenarios)
+            part: sum(
+                scenario[part] * weight
+                for scenario, weight in zip(scenarios, weights)
+            )
             for part in ("material", "labor", "overhead")
         },
         "scenario_range": {"lower": min(totals), "upper": max(totals)},
         "scenarios": scenarios,
         "warnings": warnings,
+        "weighting": f"近期情景指数加权（decay={decay:.2f}）",
+        "recency_decay": decay,
     }
 
 
@@ -234,9 +258,12 @@ def _main() -> None:
     parser.add_argument("--cost-dir", type=Path, default=RAW_CSV / "cost_data", help="成本明细目录")
     parser.add_argument("--market-dir", type=Path, default=RAW_CSV / "market_data", help="行业行情目录")
     parser.add_argument("--as-of", help="用于回测的实绩截止月（YYYY-MM）")
+    parser.add_argument("--decay", type=float, default=RECENCY_DECAY,
+                        help="近期情景权重衰减系数（0~1，默认 0.8）")
     args = parser.parse_args()
     try:
-        result = forecast(args.product, cost_dir=args.cost_dir, market_dir=args.market_dir, as_of=args.as_of)
+        result = forecast(args.product, cost_dir=args.cost_dir, market_dir=args.market_dir,
+                          as_of=args.as_of, decay=args.decay)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))

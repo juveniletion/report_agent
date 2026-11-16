@@ -261,7 +261,7 @@ def forecast_scenarios_api(product: str = Query(...),
         pass
 
     result["ok"] = True
-    result["method"] = "历史情景概率模型（等权）"
+    result["method"] = "历史情景概率模型（近期加权）"
     result["expected_unit_cost"] = r3(result.get("expected_unit_cost"))
     result["scenario_range"] = {
         k: r3(v) for k, v in (result.get("scenario_range") or {}).items()
