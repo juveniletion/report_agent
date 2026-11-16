@@ -2586,6 +2586,31 @@ function ExportBar({ me }) {
     setBusy("");
   };
 
+  const doMyExport = async (md, fmt) => {
+    const key = "my-" + md + fmt;
+    setBusy(key); setErr("");
+    try {
+      const r = await fetch("/api/control/my-export", {
+        method: "POST", credentials: "same-origin",
+        headers: writeHeaders(),
+        body: JSON.stringify({ kind: "report", md, fmt, charts: true }),
+      });
+      if (r.status === 401 || r.status === 403)
+        throw new Error("登录已过期，请重新登录");
+      if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+      const blob = await r.blob();
+      const cd = r.headers.get("content-disposition") || "";
+      const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/.exec(cd);
+      const name = m ? decodeURIComponent(m[1]) : `${md}.${fmt}`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) { setErr("个人导出失败：" + String(e.message || e)); }
+    setBusy("");
+  };
+
   if (!me) return html`<${LoginGate} what="文档导出"
                                onGoLogin=${() => (location.hash = "login")} />`;
 
@@ -2597,6 +2622,7 @@ function ExportBar({ me }) {
 
     <details class="wsbox" open=${!!(myDocs && myDocs.count)}>
       <summary>我的报告 <span class="hint">个人数据生成，仅自己可见</span></summary>
+      ${err ? html`<div class="alert" style=${{ margin: "8px 0" }}>⚠️ ${err}</div>` : null}
       ${myDocs && myDocs.items && myDocs.items.length ? html`
         ${myDocs.items.map(r => html`
           <div class="exp-row" key=${r.name}>
@@ -2604,6 +2630,11 @@ function ExportBar({ me }) {
             <a class="chip" href=${"/api/control/my-download?name=" + encodeURIComponent(r.name)}>
               下载 ${r.kind.toUpperCase()}
             </a>
+            ${r.kind === "md" ? ["docx", "pdf"].map(f => html`
+              <button key=${f} class="chip" disabled=${!!busy}
+                      onClick=${() => doMyExport(r.name, f)}>
+                ${busy === "my-" + r.name + f ? "导出中…" : f.toUpperCase() + "（含图）"}
+              </button>`) : null}
           </div>`)}` : html`
         <div class="empty" style=${{ padding: "18px 0" }}>
           暂无个人报告。生成时勾选「使用我的上传数据」后，报告会出现在这里。

@@ -2039,6 +2039,46 @@ def control_my_download(name: str,
     return FileResponse(str(p), filename=p.name)
 
 
+@app.post("/api/control/my-export", summary="导出我的个人报告为 Word/PDF")
+def control_my_export(body: ExportIn,
+                      authorization: str = Header(default=""),
+                      lw_sid: str = Cookie(default="")) -> FileResponse:
+    """个人 Markdown 报告 → Word/PDF（含图），产物写个人 ws/exports。"""
+    import export_doc
+    import report_facts as RF
+
+    info = _whoami(authorization, lw_sid)
+    ws = _ws(info["external_id"])
+    if body.kind != "report":
+        raise HTTPException(400, f"未知的导出类型：{body.kind}")
+    name = Path(body.md).name
+    if not name or Path(name).suffix.lower() != ".md":
+        raise HTTPException(400, "个人导出只支持 .md 报告")
+    base = (ws / "reports").resolve()
+    src = (base / name).resolve()
+    if not src.is_file() or not src.is_relative_to(base):
+        raise HTTPException(404, f"源文件不存在：{name}")
+    if body.fmt not in ("docx", "pdf", "both"):
+        raise HTTPException(400, "fmt 只能是 docx / pdf / both")
+
+    out_dir = ws / "exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with RF.report_context(personal_root=ws, use_personal=True):
+            outs = export_doc.export(src, body.fmt, out_dir,
+                                     title=body.title or src.stem,
+                                     with_charts=body.charts)
+    except ValueError as e:
+        raise HTTPException(400, f"个人数据校验失败：{e}")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"导出失败：{type(e).__name__}: {e}")
+
+    pick = next((p for p in outs if p.suffix == ".pdf"), outs[0])
+    media = {"docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+             "pdf": "application/pdf"}[pick.suffix.lstrip(".")]
+    return FileResponse(str(pick), media_type=media, filename=pick.name)
+
+
 @app.post("/api/control/export", summary="导出 Word/PDF")
 def control_export(body: ExportIn, authorization: str = Header(default=""), lw_sid: str = Cookie(default="")) -> FileResponse:
     """

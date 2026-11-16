@@ -268,7 +268,7 @@ python scripts/agent_auth.py --set-pw alice   # 给已有用户补设密码
   `中药一厂_成本汇总_*.csv`）→ 摄入 → 报告生成区勾选「使用我的上传数据」。
   个人同产品/月份覆盖共享，个人缺失回退共享；报告写入
   `data/users/<id>/ws/reports/`，只在「我的报告」中可见/下载，
-  不进入共享 `reports/`。
+  不进入共享 `reports/`；个人 `.md` 报告可再导出 Word/PDF（含图）。
 - **前端已 vendor**（React 18 + htm 本地文件，约 146KB）——**无需 npm、无需构建步骤**。
   克隆下来 `pip install` 就能跑。
 

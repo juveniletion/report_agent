@@ -19,8 +19,8 @@
 - 不支持任意 CSV 列映射。
 - 不支持季度/专题主题的个人数据（MVP 只做月度）。
 - 不新增产品；只支持现有 3 个产品。
-- 不提供个人报告的 PDF 导出/个人导出面板（Phase 2；MVP 只提供
-  `.md` / `.docx` 下载）。
+- 个人导出只从个人 `.md` 报告生成 Word/PDF；不支持从 Word 模板 docx
+  反向导出。
 - 不把个人数据写入共享 `wiki/`、`state/`、`graph/`、`reports/`、SQLite。
 
 ## 3. 数据契约
@@ -152,9 +152,10 @@ class ReportDataContext:
   - `GET /api/control/my-reports`：列出 `ws/reports/*.md|*.docx`，返回
     `{name, stem, size, kind}`。
   - `GET /api/control/my-download?name=...`：只能下载当前用户 `ws/reports/` 下的文件。
+  - `POST /api/control/my-export`：把个人 `.md` 报告导出为 Word/PDF（含图），
+    产物写 `ws/exports/`，个人成本汇总上下文内重绘图表；直接返回文件流。
 - 共享 `/api/reports`、`/api/control/exports`、`/api/control/download` 不变，不混入个人报告。
-- 文件名校验：只取 `basename`，MVP 后缀白名单 `.md/.docx`（个人 PDF 属 Phase 2）；路径必须落在当前用户 `ws/reports/`。
-- MVP 不新增个人导出接口 `my-export`；Word 模板模式直接产出 docx，markdown 直接下载。
+- 文件名校验：只取 `basename`，`my-download` 后缀白名单 `.md/.docx`；源文件必须位于当前用户 `ws/reports/`。
 - `sources` 返回结构：
   ```json
   {
@@ -176,7 +177,8 @@ class ReportDataContext:
   - 个人模式下载链接指向 `/api/control/my-download`。
   - 展示实际使用的个人文件/月份、回退共享项、警告。
 - 增加 **「我的报告」** 小列表：读取 `/api/control/my-reports`，每项提供
-  md/docx 下载；共享报告区仍只显示共享报告。
+  md/docx 下载；`.md` 项另提供 **Word（含图）/PDF（含图）** 导出按钮；
+  共享报告区仍只显示共享报告。
 - 未勾选时 UI 行为不变。
 
 ## 6. 错误处理
@@ -207,9 +209,10 @@ class ReportDataContext:
 6. **未摄入**：只上传未摄入 → 回退共享 + warning。
 7. **隔离**：用户 A 生成的个人报告，用户 B 的 `my-reports` 不可见、`my-download` 404；共享列表不含个人报告。
 8. **Word 模板 + 图表**：个人报告仍为 3 张图 + 0 残留占位符，且正文含来源说明。
-9. **共享回归**：不启用个人数据时，共享报告结果与现状一致；现有 smoke 通过。
-10. **计算校验**：个人报告跑 `check_math.py` 通过；`check_evidence` 的坐标指向个人文件。
-11. **重复文件处理**：删除旧文件后重新生成成功，不再报重复键。
+9. **个人导出**：个人 `.md` → Word/PDF 含 3 张图与来源说明；产物在 `ws/exports/`；其他用户导出 404。
+10. **共享回归**：不启用个人数据时，共享报告结果与现状一致；现有 smoke 通过。
+11. **计算校验**：个人报告跑 `check_math.py` 通过；`check_evidence` 的坐标指向个人文件。
+12. **重复文件处理**：删除旧文件后重新生成成功，不再报重复键。
 
 ## 8. 风险与取舍
 
@@ -219,7 +222,8 @@ class ReportDataContext:
 - 新增月份可能使趋势图超过 6 个月；MVP 保持现有绘图逻辑，不额外截断。
 - `check_evidence` 需要以个人 ws 为数据根才有意义；MVP 先保证坐标真实，后续补个人校验命令。
 - contextvar 在 FastAPI 同步线程池中的传播需要实测；若不可靠，改为显式传参。
-- 个人 PDF 导出不在 MVP；Phase 2 再补 `my-export` 与 PDF 下载。
+- 个人 PDF 导出依赖服务端 pandoc/LaTeX；与共享导出一致，构建镜像已包含。
+- 个人导出从 `.md` 生成；Word 模板 docx 不参与反向导出。
 - 个人报告正文来源说明会增加一段文字；Word 模板需在标题后插入，不能只靠前端展示。
 
 ## 9. 变更文件（预计）
@@ -227,7 +231,7 @@ class ReportDataContext:
 - `scripts/report_facts.py`：context、成本汇总合并、行完整性/恒等式校验、来源坐标、来源清单。
 - `scripts/report_build.py`：包装 build、`out_dir`、stats、报告正文来源说明。
 - `scripts/template_docx.py`：Word 模板标题后插入来源说明。
-- `server/app.py`：`use_personal`、个人输出、my-reports/my-download。
+- `server/app.py`：`use_personal`、个人输出、my-reports/my-download/my-export。
 - `server/static/app.js`：复选框、来源/警告展示、我的报告列表、下载链接。
 - `README.md` / `官方运行指南.md` / `CLAUDE.md`：数据来源与隔离说明。
 - 测试：临时工作区脚本（直接调用 `report_build`）+ `scripts/smoke_docker.py`
@@ -236,5 +240,5 @@ class ReportDataContext:
 ## 10. 阶段
 
 - **Phase 1（本 spec）**：成本汇总 MVP + 个人报告隔离。
-- **Phase 2**：其余 8 类表个人覆盖、每表来源坐标、季度/专题、个人 PDF/导出。
+- **Phase 2**：其余 8 类表个人覆盖、每表来源坐标、季度/专题。
 - **Phase 3**：个人证据校验命令、更多 schema 测试。
