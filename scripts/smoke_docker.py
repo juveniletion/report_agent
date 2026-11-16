@@ -162,6 +162,8 @@ def main() -> int:
         ("products", "/api/products"),
         ("benchmark", f"/api/benchmark?{P}"),
         ("forecast", f"/api/forecast?{P}"),
+        ("forecast/scenarios",
+         "/api/forecast/scenarios?" + urllib.parse.urlencode({"product": "银黄口服液"})),
         ("rpa/health", "/api/rpa/health"),
         ("control/exports", "/api/control/exports"),
     ]:

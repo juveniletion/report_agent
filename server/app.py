@@ -226,6 +226,63 @@ def forecast_api(product: str = Query(...), horizon: int = Query(2, ge=1, le=6),
     }
 
 
+@app.get("/api/forecast/scenarios", summary="历史情景成本预测（加分项）")
+def forecast_scenarios_api(product: str = Query(...),
+                           as_of: Optional[str] = Query(None),
+                           authorization: str = Header(default=""),
+                           lw_sid: str = Cookie(default="")) -> Dict[str, Any]:
+    """
+    基于历史月度成本 + 材料行情联合情景，预测下月单位成本。
+
+    ⚠️ 这是**外推**，没有 raw 坐标；区间是历史情景的最小/最大范围，
+       不是统计置信区间。前端必须展示 `warnings`，不得当成承诺值。
+    """
+    import forecast_scenarios as FS
+
+    try:
+        result = FS.forecast(product, as_of=as_of)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "product": product,
+                "error": f"{type(e).__name__}: {e}"}
+
+    def r3(v: Any) -> Optional[float]:
+        return None if v is None else round(float(v), 3)
+
+    history: List[Dict[str, Any]] = []
+    n_samples = 0
+    try:
+        fs = RF.build(product, as_of or "2026-05")
+        history = [{"月份": r["月份"],
+                    "单位成本": RF._num(r.get("单位成本"))}
+                   for r in fs.monthly
+                   if RF._num(r.get("单位成本")) is not None]
+        n_samples = len(history)
+    except Exception:  # noqa: BLE001
+        pass
+
+    result["ok"] = True
+    result["method"] = "历史情景概率模型（等权）"
+    result["expected_unit_cost"] = r3(result.get("expected_unit_cost"))
+    result["scenario_range"] = {
+        k: r3(v) for k, v in (result.get("scenario_range") or {}).items()
+    }
+    result["component_expectations"] = {
+        k: r3(v) for k, v in (result.get("component_expectations") or {}).items()
+    }
+    result["scenarios"] = [
+        {**s,
+         "material": r3(s.get("material")),
+         "labor": r3(s.get("labor")),
+         "overhead": r3(s.get("overhead")),
+         "unit_cost": r3(s.get("unit_cost"))}
+        for s in (result.get("scenarios") or [])
+    ]
+    result["history"] = history
+    result["n_samples"] = n_samples
+    result["scope"] = "shared"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 冲突登记表 —— 解析全库 Status 块
 # ---------------------------------------------------------------------------
