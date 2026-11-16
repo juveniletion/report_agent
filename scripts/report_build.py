@@ -236,6 +236,65 @@ def display_priority(v: Any) -> str:
     return {"high": "高", "medium": "中", "low": "低"}[rpa]
 
 
+def deterministic_advice(fs: RF.FactSet, th: Dict[str, Any],
+                         month: str) -> List[Dict[str, str]]:
+    """
+    **无 LLM 时的改进建议**：只按已算好的事实做规则映射。
+
+    这不是"假装 AI 写的"：
+      · 有超阈值要素 → 每项生成一条复核任务
+      · 无超阈值     → 跟踪贡献度最高的要素
+      · 责任部门/优先级/截止时间是固定规则，数字全部来自 FactSet
+    报告顶部的「演示模式」会明确标注建议由规则生成。
+    """
+    def val(key: str) -> Optional[float]:
+        f = fs.facts.get(key)
+        return None if f is None else f.value
+
+    try:
+        y, m = int(month[:4]), int(month[5:7])
+    except (ValueError, IndexError):
+        y, m = 2026, 1
+    ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+    due = f"{ny:04d}-{nm:02d}-15"
+
+    DEPT = {
+        "直接材料": "采购部",
+        "直接人工": "生产部",
+        "制造费用": "设备部",
+    }
+    advice: List[Dict[str, str]] = []
+
+    for label, display in (th.get("breaches") or [])[:3]:
+        mnum = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%", str(display))
+        pct = abs(float(mnum.group(1))) if mnum else 0.0
+        advice.append({
+            "建议事项": f"复核{label}环比异常（{display}），制定下月回落措施",
+            "责任部门": DEPT.get(label, "财务部"),
+            "优先级": "高" if pct >= 15 else "中",
+            "预期效果": f"下月回落至 ±{th.get('threshold', 10):.0f}% 阈值内",
+            "建议完成时间": due,
+        })
+
+    if not advice:
+        cands = [
+            ("直接材料", "材料贡献度", "采购部"),
+            ("直接人工", "人工贡献度", "生产部"),
+            ("制造费用", "制造费用贡献度", "设备部"),
+        ]
+        best = max(cands, key=lambda x: abs(val(x[1]) or 0))
+        share = val(best[1])
+        if share is not None:
+            advice.append({
+                "建议事项": f"持续跟踪{best[0]}（贡献度 {share:.1f}%）的月度波动，复核预算偏差",
+                "责任部门": best[2],
+                "优先级": "中",
+                "预期效果": "将单位成本预算偏差控制在 ±5% 以内",
+                "建议完成时间": due,
+            })
+    return advice
+
+
 def render_task_table(advice: List[Dict[str, str]], month: str,
                       product: str) -> str:
     """
@@ -818,6 +877,11 @@ def build(product: str, month: str, use_llm: bool = True,
 
     # 波动告警结论先由脚本定死，再决定要不要让 LLM 写重点分析
     th = evaluate_threshold(fs)
+    if not use_llm:
+        # 无 LLM 时的确定性建议/整改任务：规则生成，数字来自 FactSet。
+        _advice = deterministic_advice(fs, th, month)
+        vals["改进建议表格"] = render_advice_table(_advice)
+        vals["整改任务表格"] = render_task_table(_advice, month, fs.product)
     if verbose:
         n = len(th["breaches"])
         print(f"  波动阈值判定（脚本，±{th['threshold']:.0f}%）："

@@ -249,6 +249,9 @@ def build_task(briefs: List[Dict[str, Any]]) -> str:
         "请你按 INGEST_AGENT.md 的流程完成 **分诊 → 编译 → 级联 → 收尾**。",
         "",
         "⚠️ 关键提醒（本库犯过的错，别重犯）：",
+        "0. **硬性停止条件（优先于一切）**：同一个 `grep_raw` pattern 最多调用 **2 次**；"
+        "同一文件最多读 **3 次**。达到上限必须停止检索——查不到就按 SKILL.md "
+        "删除精确值或写 `Status: Disputed`，然后继续写词条。**不要在一个数值上反复搜索。**",
         "1. **先问「长进哪一页」，再问「要不要新建页」**——"
         "已有实体的新数据一律 `patch_wiki_article` 并入，不要建批次页。",
         "2. **写任何数值前先 `grep_raw` 定位**——找不到就不许写它的精确形式。",
@@ -260,6 +263,9 @@ def build_task(briefs: List[Dict[str, Any]]) -> str:
         "（实测有人连查 58 次全落空，最后把任务拖崩，零产出）。"
         "⚠️ `log.md` 是历史记录，可能引用已删除的文件；"
         "判断库里有什么要看 `raw/` 和 `wiki/`。",
+        "6. **已知折旧率口径**：raw 写 `0.7917%`；SKILL.md §9.9 的 `0.8333%` 是"
+        "按 1/120 复算的派生口径。两者不一致时按 `Status: Disputed` 登记，"
+        "**不要**继续 grep `0.8333`。",
         "",
         "## ⭐ 编译前必须完成的一步：冲突扫描",
         "",
@@ -319,6 +325,7 @@ def run(agent: Any, task: str, verbose: bool = True) -> str:
     """流式执行，打印工具调用轨迹；返回最终回答。"""
     final = ""
     step_n = 0
+    recent: List[tuple] = []
     for step in agent.stream({"messages": [("user", task)]}, stream_mode="updates"):
         for _node, out in step.items():
             for msg in out.get("messages", []):
@@ -326,6 +333,16 @@ def run(agent: Any, task: str, verbose: bool = True) -> str:
                 if tc:
                     for c in tc:
                         step_n += 1
+                        # 循环防护：同一 (工具, 参数) 第 5 次出现即中止。
+                        # 实测 flash 模型会在一个查不到的数值上反复 grep。
+                        key = (c["name"], json.dumps(c.get("args", {}),
+                                                     sort_keys=True,
+                                                     ensure_ascii=False))
+                        recent.append(key)
+                        if recent.count(key) >= 5:
+                            raise RuntimeError(
+                                f"检测到重复工具调用 {c['name']} 5 次，已中止："
+                                f"{str(c.get('args'))[:200]}")
                         if verbose:
                             args = str(c["args"])
                             print(f"  [{step_n:>2}] 调用 {c['name']}")

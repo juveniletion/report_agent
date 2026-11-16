@@ -1798,12 +1798,23 @@ function Rectify({ me, onNeedLogin, onAuthed }) {
  *    这里和「上传区」的处理不同：上传区是滑到才看见的次要功能，
  *    而问答区在首屏——摆一个点了没反应的输入框比给张登录卡更让人困惑。
  * ========================================================================== */
+const ROUTE_LABEL = {
+  state: "① 库直答（0 token）",
+  small: "② 小模型（Qwen2.5-7B）",
+  large: "③ 大模型（DeepSeek）",
+  unavailable: "知识库镜像不可用",
+};
+const routeLabel = lv => ROUTE_LABEL[lv] || lv || "未知";
+
 function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
   const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [meta, setMeta] = useState(null);
   const [showTrace, setShowTrace] = useState({});
+  /* 多模型路由演示：开启后提问走 /api/route（三层阶梯），
+     而不是默认的 /api/chat（Agent 大模型）。回答不写入会话历史。 */
+  const [routeMode, setRouteMode] = useState(false);
   const boxRef = useRef(null);
   /* 多会话：当前会话 id 与列表。
    * ⚠️ `convId === null` 表示**尚未落库的新对话**——用户点了"新对话"但还没提问。
@@ -1919,6 +1930,27 @@ function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
       const c = m.slice(), i = c.length - 1;
       c[i] = Object.assign({}, c[i]); fn(c[i]); return c;
     });
+
+    /* 多模型路由演示：走 /api/route，不写会话历史。
+       返回 level（state/small/large）+ trace，前端显示走了哪一档。 */
+    if (routeMode) {
+      try {
+        const r = await api("/api/route", {
+          method: "POST",
+          body: { question: q },
+        });
+        if (r._error) throw new Error(r._error);
+        patch(t => {
+          t.content = r.answer || "";
+          t.route = { level: r.level, trace: r.trace || [],
+                      escalated: !!r.escalated };
+        });
+      } catch (e) {
+        patch(t => { t.err = "路由失败：" + String(e.message || e); });
+      }
+      setBusy(false);
+      return;
+    }
 
     try {
       /* SSE 流式：不能用 api()（那个会把响应读成 JSON）。 */
@@ -2042,6 +2074,18 @@ function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
                   onClick=${e => deleteConv(convId, e)}>删除</button>` : null}
       </div>
 
+      <div class="route-toggle-row">
+        <label class="route-toggle"
+               title="演示 router.py 的三层阶梯：库直答 → 小模型 → 大模型。回答不写入会话历史。">
+          <input type="checkbox" checked=${routeMode} disabled=${busy}
+                 onChange=${e => setRouteMode(e.target.checked)} />
+          多模型路由
+        </label>
+        ${routeMode ? html`<span class="route-hint">
+          演示：库直答 → 小模型 → 大模型；回答不写入会话历史
+        </span>` : null}
+      </div>
+
       <form class="askbar" onSubmit=${e => { e.preventDefault(); ask(input); }}>
         <span class="askbar-icon">💬</span>
         <input value=${input} disabled=${busy}
@@ -2095,6 +2139,18 @@ function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
                   </div>` : null}
                 ${m.compact ? html`<div class="compact-note">
                   为保持对话流畅，此前部分内容已归纳为摘要</div>` : null}
+                ${m.route ? html`
+                  <div class="route-line">
+                    <span class=${"route-badge " + (m.route.level || "")}>
+                      ${routeLabel(m.route.level)}
+                    </span>
+                    ${m.route.escalated ? html`
+                      <span class="route-note">小模型校验未过，已升级</span>` : null}
+                    <details class="route-trace">
+                      <summary>决策轨迹</summary>
+                      <pre>${(m.route.trace || []).join("\n")}</pre>
+                    </details>
+                  </div>` : null}
                 ${running
                   ? html`<div class="txt typing">
                       ${m.content || "正在查阅资料，请稍候…"}</div>`
@@ -2341,6 +2397,8 @@ function ReportGen({ me, onGenerated }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
+  const [word, setWord] = useState(false);
+  const [wordFile, setWordFile] = useState("");
 
   const MONTHS = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"];
   const t = ((th && th.themes) || []).find(x => x.id === theme) || {};
@@ -2357,14 +2415,23 @@ function ReportGen({ me, onGenerated }) {
   }, [theme, th]);
 
   const gen = async () => {
-    setBusy(true); setMsg(""); setErr("");
+    setBusy(true); setMsg(""); setErr(""); setWordFile("");
     try {
       const r = await api("/api/control/generate", {
         method: "POST",
-        body: { product, month, theme, period },
+        body: {
+          product, month, theme, period,
+          template_docx: (word && theme === "monthly")
+            ? "月度成本分析报告模板.docx" : "",
+        },
       });
       if (r._error) throw new Error(r._error);
-      setMsg(r.message || `已生成 ${r.file}（${r.stats.deterministic_fields} 个确定性值）`);
+      if (r.docx) {
+        setWordFile(r.file);
+        setMsg(r.message || `已按 Word 模板生成 ${r.file}`);
+      } else {
+        setMsg(r.message || `已生成 ${r.file}（${(r.stats && r.stats.deterministic_fields) || 0} 个确定性值）`);
+      }
       onGenerated && onGenerated();
     } catch (e) { setErr("生成失败：" + String(e.message || e)); }
     setBusy(false);
@@ -2377,7 +2444,9 @@ function ReportGen({ me, onGenerated }) {
       <summary>按主题生成报告 <span class="hint">月度 / 季度 / 专题</span></summary>
       <p class="sec-sub" style=${{ marginTop: 12 }}>
         选择分析主题、期间与产品，系统自动生成完整报告（数字由脚本算，
-        叙述由大模型写）。生成后可到下方「导出文档」转成 Word / PDF。
+        叙述由大模型写）。勾选「使用 Word 模板」会直接填充赛题提供的 .docx，
+        保留原有字体与表格样式；不勾选则生成 .md，可在下方「导出文档」
+        转成 Word / PDF（含图）。
       </p>
       <div class="toolbar" style=${{ flexWrap: "wrap", gap: 10 }}>
         <label>分析主题</label>
@@ -2404,11 +2473,26 @@ function ReportGen({ me, onGenerated }) {
             <option key=${p} value=${p}>${p}</option>`)}
         </select>
 
+        ${theme === "monthly" ? html`
+          <label class="word-opt"
+                 title="直接填充赛题提供的 .docx 模板，保留其字体/表格样式">
+            <input type="checkbox" checked=${word}
+                   onChange=${e => setWord(e.target.checked)} />
+            使用 Word 模板
+          </label>` : null}
+
         <button class="chip" type="button" disabled=${busy} onClick=${gen}>
           ${busy ? "生成中…（要调大模型，约 10-30 秒）" : "生成报告"}
         </button>
       </div>
-      ${msg ? html`<div class="alert ok" style=${{ marginTop: 10 }}>✅ ${msg}</div>` : null}
+      ${msg ? html`<div class="alert ok" style=${{ marginTop: 10 }}>
+        ✅ ${msg}
+        ${wordFile ? html`
+          <a class="chip" style=${{ marginLeft: 8 }}
+             href=${"/api/control/download?name=" + encodeURIComponent(wordFile)}>
+            下载 Word
+          </a>` : null}
+      </div>` : null}
       ${err ? html`<div class="alert" style=${{ marginTop: 10 }}>${err}</div>` : null}
     </details>`;
 }
@@ -2874,8 +2958,11 @@ const TABS = [
   { id: "login",     label: "登录" },
 ];
 
-// 导航条上真正显示的那些（profile/login 走顶栏与跳转，不占导航）
-const NAV_TABS = TABS.filter(t => t.id !== "profile" && t.id !== "login");
+// 导航条上真正显示的那些（profile/login 走顶栏与跳转，不占导航）。
+// 「数据说明 / 更新记录」是内部/审计视角，面向普通用户不占一级导航；
+// 它们仍在 TABS 里，直接 URL 和页脚入口都能到达。
+const NAV_TABS = TABS.filter(
+  t => !["profile", "login", "notes", "history"].includes(t.id));
 
 /* 旧链接兼容：`#overview` / `#chat` / `#panel` 都指向首页。
  * 用户可能存了旧书签，或分享过带旧锚点的链接——
@@ -3001,6 +3088,10 @@ function App() {
       </div>
 
       <footer class="foot">
+        <a href="#notes">数据口径说明</a>
+        <span> · </span>
+        <a href="#history">更新记录</a>
+        <span> ｜ </span>
         本系统所有数字均可在原始资料中逐项核对 ｜ 分析文本由 AI 辅助生成，请结合业务判断
       </footer>
     </div>`;
