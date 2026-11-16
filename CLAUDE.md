@@ -45,7 +45,7 @@ python scripts/report_build.py --product 银黄口服液 --month 2026-05 [--dry-
 python scripts/export_doc.py --md reports/银黄口服液_2026-05.md --to both [--charts]
 python scripts/benchmark_engine.py --product 银黄口服液 --month 2026-05 [--no-llm]
 python scripts/forecast.py --product 银黄口服液 --horizon 1
-python scripts/forecast_scenarios.py --product 银黄口服液 [--as-of 2026-05]  # 历史情景模型（下月）
+python scripts/forecast_scenarios.py --product 银黄口服液 [--as-of 2026-05] [--decay 0.8]  # 历史情景模型（近期加权，下月）
 python scripts/period_agg.py --product 银黄口服液 --quarter 2026-Q2
 
 # Retrieval and agents
