@@ -45,6 +45,7 @@ python scripts/report_build.py --product 银黄口服液 --month 2026-05 [--dry-
 python scripts/export_doc.py --md reports/银黄口服液_2026-05.md --to both [--charts]
 python scripts/benchmark_engine.py --product 银黄口服液 --month 2026-05 [--no-llm]
 python scripts/forecast.py --product 银黄口服液 --horizon 1
+python scripts/forecast_scenarios.py --product 银黄口服液 [--as-of 2026-05]  # 历史情景模型（下月）
 python scripts/period_agg.py --product 银黄口服液 --quarter 2026-Q2
 
 # Retrieval and agents
@@ -147,7 +148,7 @@ The judgment rule: **when a derived view disagrees with `wiki/`, the derived vie
 
 ### Server and agents
 
-`server/app.py` (FastAPI) is the deterministic orchestrator. Endpoint groups: read-only dashboard (`/api/health`, `/products`, `/overview`, `/trend`, `/forecast`, `/heatmap`, `/conflicts`, `/timeline`, `/graph`, `/benchmark`, `/reports`), search/Q&A (`/api/search`, `/api/chat` SSE, `/api/route`, `/api/decide`), auth & conversations (`/api/auth/*`, `/api/profile`, `/api/me`, `/api/conversations/*`), personal control panel (`/api/control/*` upload/ingest/generate/export/download, plus user-scoped `my-reports`/`my-download`/`my-export`), and RPA tracking (`/api/rpa/*`, including tasks/dispatch/notify). Expected failures must raise `DataMissing` (→503) or `ConfigError` (→501) so the JSON body reaches the client; do not use `SystemExit` in request paths.
+`server/app.py` (FastAPI) is the deterministic orchestrator. Endpoint groups: read-only dashboard (`/api/health`, `/products`, `/overview`, `/trend`, `/forecast`, `/forecast/scenarios`, `/heatmap`, `/conflicts`, `/timeline`, `/graph`, `/benchmark`, `/reports`), search/Q&A (`/api/search`, `/api/chat` SSE, `/api/route`, `/api/decide`), auth & conversations (`/api/auth/*`, `/api/profile`, `/api/me`, `/api/conversations/*`), personal control panel (`/api/control/*` upload/ingest/generate/export/download, plus user-scoped `my-reports`/`my-download`/`my-export`), and RPA tracking (`/api/rpa/*`, including tasks/dispatch/notify). Expected failures must raise `DataMissing` (→503) or `ConfigError` (→501) so the JSON body reaches the client; do not use `SystemExit` in request paths.
 
 There are **three independent ReAct agents** (`langgraph.prebuilt.create_react_agent`), not a multi-agent system and not orchestrated by another model:
 

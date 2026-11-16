@@ -2828,27 +2828,44 @@ function HomeForecast() {
   }, [prod, product]);
 
   const q = product
-    ? `/api/forecast?product=${encodeURIComponent(product)}&horizon=2` : "";
+    ? `/api/forecast/scenarios?product=${encodeURIComponent(product)}` : "";
   const { data, loading, error } = useApi(q || "/api/products");
 
   if (!product || loading) return html`<section class="home-sec"><${Loading} /></section>`;
   if (error) return html`<section class="home-sec"><${ErrorBox} msg=${error} /></section>`;
-  if (!data || !data.predictions || !data.predictions.length) return null;
+  if (!data || data.ok === false) {
+    return html`<section class="home-sec">
+      <${ErrorBox} msg=${(data && data.error) || "情景预测暂时不可用"} />
+    </section>`;
+  }
+  if (!data.scenarios || !data.expected_unit_cost) return null;
 
-  const last = data.history[data.history.length - 1];
-  const p1 = data.predictions[0];
-  const chg = last ? (p1.预测值 - last.单位成本) : 0;
+  const last = data.history && data.history.length
+    ? data.history[data.history.length - 1] : null;
+  const range = data.scenario_range || {};
+  const chg = last && last.单位成本 != null
+    ? data.expected_unit_cost - last.单位成本 : null;
+  const pct = chg != null && last.单位成本
+    ? chg / last.单位成本 * 100 : null;
+  const components = [
+    { key: "material", label: "直接材料", color: "#0F766E" },
+    { key: "labor", label: "直接人工", color: "#F59E0B" },
+    { key: "overhead", label: "制造费用", color: "#6366F1" },
+  ].map(c => ({ ...c, value: (data.component_expectations || {})[c.key] }));
+  const compTotal = components.reduce((s, c) => s + (c.value || 0), 0);
 
   return html`
     <section class="home-sec">
       <div class="card fc-card">
         <h2>成本趋势预测
           <span class="fc-tag">外推</span>
-          <span class="hint">${data.method}　·　样本 ${data.n_samples} 个点</span>
+          <span class="hint">${data.method}　·　${data.as_of} → ${data.forecast_month}　·　样本 ${data.n_samples} 个点</span>
         </h2>
         <p class="card-sub">
-          基于历史单位成本外推，<strong>不是已发生的数</strong>——
-          预测值没有原始坐标，与看板其余数字的性质不同，请连同区间一起读。
+          基于历史月度成本与材料行情的<strong>联合情景</strong>预测下月单位成本。
+          这里的数字<strong>不是已发生的数</strong>，也没有 raw 坐标；
+          区间是历史情景的最低~最高范围，<strong>不是统计置信区间</strong>。
+          当前只使用共享基线，个人成本汇总不参与预测。
         </p>
 
         <div class="toolbar" style=${{ marginBottom: 16 }}>
@@ -2861,28 +2878,66 @@ function HomeForecast() {
 
         <table class="tbl">
           <thead><tr>
-            <th>月份</th><th class="num">预测值（元/盒）</th>
-            <th class="num">参考区间</th><th>相对上月实际</th>
+            <th>月份</th><th class="num">单位成本（元/盒）</th>
+            <th class="num">情景范围</th><th>相对上月实际</th>
           </tr></thead>
           <tbody>
+            ${last ? html`
+              <tr>
+                <td>${last.月份}<span class="hint">（实际）</span></td>
+                <td class="num">${fmt(last.单位成本)}</td>
+                <td class="num">—</td><td>—</td>
+              </tr>` : null}
             <tr>
-              <td>${last.月份}<span class="hint">（实际）</span></td>
-              <td class="num">${fmt(last.单位成本)}</td>
-              <td class="num">—</td><td>—</td>
+              <td>${data.forecast_month}</td>
+              <td class="num strong">${fmt(data.expected_unit_cost)}</td>
+              <td class="num">${fmt(range.lower)} ~ ${fmt(range.upper)}</td>
+              <td class=${cls(chg)}>
+                ${chg != null && pct != null
+                  ? `${ARROW(chg)} ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`
+                  : "—"}
+              </td>
             </tr>
-            ${data.predictions.map(p => html`
-              <tr key=${p.月份}>
-                <td>${p.月份}</td>
-                <td class="num strong">${fmt(p.预测值)}</td>
-                <td class="num">${fmt(p.下限)} ~ ${fmt(p.上限)}</td>
-                <td class=${cls(p.步长 === 1 ? chg : (p.预测值 - last.单位成本))}>
-                  ${p.步长 === 1 && last
-                    ? `${ARROW(chg)} ${(chg / last.单位成本 * 100).toFixed(2)}%`
-                    : "—"}
-                </td>
+          </tbody>
+        </table>
+
+        <h3 class="ws-h" style=${{ marginTop: 18 }}>下月成本构成期望</h3>
+        <table class="tbl">
+          <thead><tr><th>成本要素</th><th class="num">期望值（元/盒）</th><th class="num">占比</th></tr></thead>
+          <tbody>
+            ${components.map(c => html`
+              <tr key=${c.key}>
+                <td><i style=${{ display: "inline-block", width: 9, height: 9,
+                                 borderRadius: 2, background: c.color,
+                                 marginRight: 6 }}></i>${c.label}</td>
+                <td class="num">${fmt(c.value)}</td>
+                <td class="num">${compTotal ? fmt(c.value / compTotal * 100, 1) + "%" : "—"}</td>
               </tr>`)}
           </tbody>
         </table>
+
+        <details class="wsbox" style=${{ marginTop: 14 }}>
+          <summary>查看 ${(data.scenarios || []).length} 个历史情景
+            <span class="hint">等权；不是概率预测</span></summary>
+          <table class="tbl" style=${{ marginTop: 10 }}>
+            <thead><tr>
+              <th>情景</th><th class="num">权重</th>
+              <th class="num">材料</th><th class="num">人工</th>
+              <th class="num">制造费用</th><th class="num">单位成本</th>
+            </tr></thead>
+            <tbody>
+              ${(data.scenarios || []).map((s, i) => html`
+                <tr key=${i}>
+                  <td>${s.from_month} → ${s.to_month}</td>
+                  <td class="num">${(s.probability * 100).toFixed(0)}%</td>
+                  <td class="num">${fmt(s.material)}</td>
+                  <td class="num">${fmt(s.labor)}</td>
+                  <td class="num">${fmt(s.overhead)}</td>
+                  <td class="num strong">${fmt(s.unit_cost)}</td>
+                </tr>`)}
+            </tbody>
+          </table>
+        </details>
 
         ${(data.warnings || []).length ? html`
           <div class="fc-warn">
