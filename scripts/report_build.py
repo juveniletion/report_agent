@@ -814,11 +814,12 @@ def generate_analysis(fs: RF.FactSet, llm: Any, verbose: bool = True,
 # 四、编排
 # ---------------------------------------------------------------------------
 
-def build(product: str, month: str, use_llm: bool = True,
-          verbose: bool = True,
-          template_docx: Optional[str] = None,
-          docx_out_path: Optional[str] = None,
-          theme: str = "monthly", period: str = "") -> Dict[str, Any]:
+def _build_impl(product: str, month: str, use_llm: bool = True,
+                verbose: bool = True,
+                template_docx: Optional[str] = None,
+                docx_out_path: Optional[str] = None,
+                theme: str = "monthly", period: str = "",
+                out_dir: Optional[Path] = None) -> Dict[str, Any]:
     """
     `theme`（赛题 5.1.3 的「分析主题」）：
 
@@ -917,7 +918,8 @@ def build(product: str, month: str, use_llm: bool = True,
     if template_docx is not None:
         import template_docx as TD
         docx_out, missing = TD.fill_docx(
-            Path(template_docx), vals, Path(docx_out_path or (OUT_DIR / f"{product}_{month}.docx")),
+            Path(template_docx), vals,
+            Path(docx_out_path or ((out_dir or OUT_DIR) / f"{product}_{month}.docx")),
             blank_keys={"重点分析段落"})
         # 赛题 5.1.3「图表嵌入」：Word 模板路径同样生成三张图并插入。
         # 与 export_doc 的 markdown 导出复用同一套 chart_render 数据，不新增计算。
@@ -947,9 +949,75 @@ def build(product: str, month: str, use_llm: bool = True,
         "conflicts": fs.conflicts,
         "data_missing": fs.missing,
         "charts": charts_inserted,
+        "sources": getattr(fs, "sources", {}),
+        "warnings": getattr(fs, "warnings", []),
     }
     return {"report": report, "facts": fs, "stats": stats, "analysis": analysis,
             "docx": docx_out}
+
+
+def _source_note(stats: Dict[str, Any]) -> str:
+    """个人报告正文的来源说明（Markdown / Word 共用）。"""
+    srcs = stats.get("sources") or {}
+    if srcs.get("scope") != "personal":
+        return ""
+    parts: List[str] = []
+    pfiles = srcs.get("personal_files") or []
+    if pfiles:
+        parts.append("个人成本汇总：" + "、".join(pfiles))
+    else:
+        parts.append("个人成本汇总：未找到可用文件，已回退共享")
+    parts.append("成本汇总相关数值（含对标的一厂值）按上述来源；"
+                 "原材料/人工/制造费用/预算/行情等明细来自共享基线")
+    warns = stats.get("warnings") or []
+    if warns:
+        parts.append("警告：" + "；".join(warns[:3]))
+    return "数据来源：" + "；".join(parts)
+
+
+def _insert_md_source_note(report: str, note: str) -> str:
+    """在 Markdown 标题后插入来源说明，标题必须留在第一行。"""
+    import re as _re
+    parts = report.splitlines()
+    line = "> " + note
+    if parts and parts[0].startswith("# "):
+        return parts[0] + "\n\n" + line + "\n\n" + "\n".join(parts[1:]).lstrip("\n")
+    return line + "\n\n" + report
+
+
+def build(product: str, month: str, use_llm: bool = True,
+          verbose: bool = True,
+          template_docx: Optional[str] = None,
+          docx_out_path: Optional[str] = None,
+          theme: str = "monthly", period: str = "",
+          use_personal: bool = False,
+          personal_root: Optional[Path] = None,
+          out_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    报告生成入口。`use_personal=True` 时在个人成本汇总上下文内取数，
+    并把产物写到 `out_dir`（通常为个人工作区的 reports/）。
+    """
+    with RF.report_context(personal_root=personal_root,
+                           use_personal=use_personal) as ctx:
+        r = _build_impl(product, month, use_llm=use_llm, verbose=verbose,
+                        template_docx=template_docx,
+                        docx_out_path=docx_out_path,
+                        theme=theme, period=period, out_dir=out_dir)
+        stats = r["stats"]
+        stats["scope"] = "personal" if ctx.use_personal else "shared"
+        # 用 FactSet 的已过滤来源（按产品筛选），不要用全局 ctx
+        stats["sources"] = getattr(r.get("facts"), "sources", {}) or {"scope": stats["scope"]}
+        stats["warnings"] = list(getattr(r.get("facts"), "warnings", []) or [])
+        if ctx.use_personal:
+            note = _source_note(stats)
+            if note:
+                if r.get("docx"):
+                    import template_docx as TD
+                    TD.insert_source_note(Path(r["docx"]), note)
+                else:
+                    r["report"] = _insert_md_source_note(r["report"], note)
+                stats["source_note"] = note
+        return r
 
 
 def main() -> int:

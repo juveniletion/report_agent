@@ -2405,6 +2405,10 @@ function ReportGen({ me, onGenerated }) {
   const [err, setErr] = useState("");
   const [word, setWord] = useState(false);
   const [wordFile, setWordFile] = useState("");
+  const [usePersonal, setUsePersonal] = useState(false);
+  const [scope, setScope] = useState("shared");
+  const [sources, setSources] = useState(null);
+  const [personalFile, setPersonalFile] = useState("");
 
   const MONTHS = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"];
   const t = ((th && th.themes) || []).find(x => x.id === theme) || {};
@@ -2422,6 +2426,7 @@ function ReportGen({ me, onGenerated }) {
 
   const gen = async () => {
     setBusy(true); setMsg(""); setErr(""); setWordFile("");
+    setScope("shared"); setSources(null); setPersonalFile("");
     try {
       const r = await api("/api/control/generate", {
         method: "POST",
@@ -2429,13 +2434,17 @@ function ReportGen({ me, onGenerated }) {
           product, month, theme, period,
           template_docx: (word && theme === "monthly")
             ? "月度成本分析报告模板.docx" : "",
+          use_personal: usePersonal && theme === "monthly",
         },
       });
       if (r._error) throw new Error(r._error);
+      setScope(r.scope || "shared");
+      setSources(r.sources || null);
       if (r.docx) {
         setWordFile(r.file);
         setMsg(r.message || `已按 Word 模板生成 ${r.file}`);
       } else {
+        if (r.scope === "personal") setPersonalFile(r.file);
         setMsg(r.message || `已生成 ${r.file}（${(r.stats && r.stats.deterministic_fields) || 0} 个确定性值）`);
       }
       onGenerated && onGenerated();
@@ -2452,7 +2461,8 @@ function ReportGen({ me, onGenerated }) {
         选择分析主题、期间与产品，系统自动生成完整报告（数字由脚本算，
         叙述由大模型写）。勾选「使用 Word 模板」会直接填充赛题提供的 .docx，
         保留原有字体与表格样式；不勾选则生成 .md，可在下方「导出文档」
-        转成 Word / PDF（含图）。
+        转成 Word / PDF（含图）。勾选「使用我的上传数据」会把个人成本汇总
+        覆盖到共享基线（仅月度；缺失月份回退共享）。
       </p>
       <div class="toolbar" style=${{ flexWrap: "wrap", gap: 10 }}>
         <label>分析主题</label>
@@ -2487,6 +2497,14 @@ function ReportGen({ me, onGenerated }) {
             使用 Word 模板
           </label>` : null}
 
+        ${theme === "monthly" ? html`
+          <label class="word-opt"
+                 title="用个人工作区里的成本汇总覆盖共享基线；其余明细仍用共享数据">
+            <input type="checkbox" checked=${usePersonal}
+                   onChange=${e => setUsePersonal(e.target.checked)} />
+            使用我的上传数据
+          </label>` : null}
+
         <button class="chip" type="button" disabled=${busy} onClick=${gen}>
           ${busy ? "生成中…（要调大模型，约 10-30 秒）" : "生成报告"}
         </button>
@@ -2495,10 +2513,30 @@ function ReportGen({ me, onGenerated }) {
         ✅ ${msg}
         ${wordFile ? html`
           <a class="chip" style=${{ marginLeft: 8 }}
-             href=${"/api/control/download?name=" + encodeURIComponent(wordFile)}>
+             href=${(scope === "personal" ? "/api/control/my-download?name="
+                                          : "/api/control/download?name=")
+                    + encodeURIComponent(wordFile)}>
             下载 Word
           </a>` : null}
+        ${personalFile ? html`
+          <a class="chip" style=${{ marginLeft: 8 }}
+             href=${"/api/control/my-download?name=" + encodeURIComponent(personalFile)}>
+            下载 Markdown
+          </a>` : null}
       </div>` : null}
+      ${sources && sources.scope === "personal" ? html`
+        <div class="alert" style=${{ marginTop: 8 }}>
+          <strong>数据来源：</strong>
+          ${(sources.personal_files || []).length
+            ? "个人成本汇总 " + sources.personal_files.join("、")
+            : "未找到可用个人成本汇总，已回退共享"}
+          ${(sources.personal_keys || []).length
+            ? html`<div>使用：${sources.personal_keys.join("、")}</div>` : null}
+          ${(sources.overridden_keys || []).length
+            ? html`<div>覆盖共享：${sources.overridden_keys.join("、")}</div>` : null}
+          <div>其余报表数据来自共享基线。</div>
+          ${(sources.warnings || []).map((w, i) => html`<div key=${i}>⚠️ ${w}</div>`)}
+        </div>` : null}
       ${err ? html`<div class="alert" style=${{ marginTop: 10 }}>${err}</div>` : null}
     </details>`;
 }
@@ -2506,12 +2544,18 @@ function ReportGen({ me, onGenerated }) {
 
 function ExportBar({ me }) {
   const [docs, setDocs] = useState(null);
+  const [myDocs, setMyDocs] = useState(null);
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
 
+  const refreshMy = () =>
+    api("/api/control/my-reports").then(d => setMyDocs(d._error ? null : d));
+
   useEffect(() => {
-    if (!me) { setDocs(null); return; }
+    if (!me) { setDocs(null); setMyDocs(null); return; }
     api("/api/control/exports").then(d => setDocs(d._error ? null : d));
+    refreshMy();
+    // eslint-disable-next-line
   }, [me]);
 
   /* POST 拿文件流，用 blob 下载——不能直接 <a href>，导出要带会话 cookie。
@@ -2546,8 +2590,25 @@ function ExportBar({ me }) {
                                onGoLogin=${() => (location.hash = "login")} />`;
 
   return html`
-    <${ReportGen} me=${me} onGenerated=${() =>
-      api("/api/control/exports").then(d => { if (!d._error) setDocs(d); })} />
+    <${ReportGen} me=${me} onGenerated=${() => {
+      api("/api/control/exports").then(d => { if (!d._error) setDocs(d); });
+      refreshMy();
+    }} />
+
+    <details class="wsbox" open=${!!(myDocs && myDocs.count)}>
+      <summary>我的报告 <span class="hint">个人数据生成，仅自己可见</span></summary>
+      ${myDocs && myDocs.items && myDocs.items.length ? html`
+        ${myDocs.items.map(r => html`
+          <div class="exp-row" key=${r.name}>
+            <span class="exp-name">${r.stem.replace("_", " · ")}</span>
+            <a class="chip" href=${"/api/control/my-download?name=" + encodeURIComponent(r.name)}>
+              下载 ${r.kind.toUpperCase()}
+            </a>
+          </div>`)}` : html`
+        <div class="empty" style=${{ padding: "18px 0" }}>
+          暂无个人报告。生成时勾选「使用我的上传数据」后，报告会出现在这里。
+        </div>`}
+    </details>
 
     <details class="wsbox">
       <summary>导出文档 <span class="hint">Word / PDF</span></summary>
