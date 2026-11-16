@@ -147,7 +147,7 @@ The judgment rule: **when a derived view disagrees with `wiki/`, the derived vie
 
 ### Server and agents
 
-`server/app.py` (FastAPI) is the deterministic orchestrator. Endpoint groups: read-only dashboard (`/api/health`, `/products`, `/overview`, `/trend`, `/forecast`, `/heatmap`, `/conflicts`, `/timeline`, `/graph`, `/benchmark`, `/reports`), search/Q&A (`/api/search`, `/api/chat` SSE, `/api/route`, `/api/decide`), auth & conversations (`/api/auth/*`, `/api/profile`, `/api/me`, `/api/conversations/*`), personal control panel (`/api/control/*` upload/ingest/generate/export/download, plus user-scoped `my-reports`/`my-download`), and RPA tracking (`/api/rpa/*`, including tasks/dispatch/notify). Expected failures must raise `DataMissing` (→503) or `ConfigError` (→501) so the JSON body reaches the client; do not use `SystemExit` in request paths.
+`server/app.py` (FastAPI) is the deterministic orchestrator. Endpoint groups: read-only dashboard (`/api/health`, `/products`, `/overview`, `/trend`, `/forecast`, `/heatmap`, `/conflicts`, `/timeline`, `/graph`, `/benchmark`, `/reports`), search/Q&A (`/api/search`, `/api/chat` SSE, `/api/route`, `/api/decide`), auth & conversations (`/api/auth/*`, `/api/profile`, `/api/me`, `/api/conversations/*`), personal control panel (`/api/control/*` upload/ingest/generate/export/download, plus user-scoped `my-reports`/`my-download`/`my-export`), and RPA tracking (`/api/rpa/*`, including tasks/dispatch/notify). Expected failures must raise `DataMissing` (→503) or `ConfigError` (→501) so the JSON body reaches the client; do not use `SystemExit` in request paths.
 
 There are **three independent ReAct agents** (`langgraph.prebuilt.create_react_agent`), not a multi-agent system and not orchestrated by another model:
 
