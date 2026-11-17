@@ -60,12 +60,13 @@ WORKDIR /app
 #      是"大文件 + 代理"下的超时抖动。）
 #
 # ---- 层 1：中文字体 + pandoc（小，~50MB）----
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i "s/deb.debian.org/mirrors.aliyun.com/g" /etc/apt/sources.list.d/debian.sources && apt-get update && apt-get install -y --no-install-recommends \
         -o Acquire::Retries=8 \
         -o Acquire::http::Timeout=90 \
         -o Acquire::https::Timeout=90 \
         fonts-noto-cjk \
         pandoc \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- 层 2：LaTeX（大，~1GB，最易抖的就是它）----
@@ -81,7 +82,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #    ⚠️ 而 `texlive-xetex` / `texlive-latex-recommended` **都不含** lmodern——
 #       Debian 把它放在**独立的 `lmodern` 包**里（试过 fonts-recommended，里面没有）。
 #       `pzdr` 则确实在 fonts-recommended 里。两个都要。
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i "s/deb.debian.org/mirrors.aliyun.com/g" /etc/apt/sources.list.d/debian.sources && apt-get update && apt-get install -y --no-install-recommends \
         -o Acquire::Retries=8 \
         -o Acquire::http::Timeout=90 \
         -o Acquire::https::Timeout=90 \
@@ -93,7 +94,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ---- Python 依赖 ----
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.txt
 
 # ---- 代码 ----
 COPY scripts/    ./scripts/
@@ -109,6 +110,18 @@ RUN mkdir -p raw wiki state reports graph exports
 
 # ---- 记忆卷 + 运行用户 ----
 RUN mkdir -p /data && useradd -m -u 10001 wiki && chown -R wiki:wiki /app /data
+
+# ---- 本地 embedding 模型（ONNX，烘进镜像，运行期离线）----
+# bge-small-zh-v1.5: 512 维、约 90MB、MIT。构建时从国内镜像下载一次；
+# 运行期不再联网，也不会把文档发给第三方。
+ENV HF_ENDPOINT=https://hf-mirror.com \
+    FASTEMBED_CACHE_PATH=/opt/fastembed \
+    EMBED_PROVIDER=local \
+    EMBED_MODEL=BAAI/bge-small-zh-v1.5
+RUN mkdir -p /opt/fastembed && \
+    python -c "from fastembed import TextEmbedding; m=TextEmbedding(model_name='BAAI/bge-small-zh-v1.5', cache_dir='/opt/fastembed'); list(m.embed(['初始化']))" && \
+    chown -R wiki:wiki /opt/fastembed
+
 USER wiki
 
 EXPOSE 8765

@@ -38,13 +38,15 @@ LLM 只拿到**算术结论**去写叙事段落，不参与任何计算。
 from __future__ import annotations
 
 import argparse
+import contextvars
 import csv
 import json
 import re
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from console_io import ensure_utf8_stdout  # noqa: E402
@@ -58,6 +60,22 @@ RAW = WIKI_ROOT / "raw"
 
 UNIT_PER_BOX = {"银黄口服液": "支", "板蓝根颗粒": "袋", "六味地黄胶囊": "粒"}
 BOX_PACK = {"银黄口服液": 10, "板蓝根颗粒": 20, "六味地黄胶囊": 60}
+PRODUCT_SPEC = {
+    "银黄口服液": "10ml×10支/盒",
+    "板蓝根颗粒": "10g×20袋/盒",
+    "六味地黄胶囊": "0.3g×60粒/盒",
+}
+
+# 个人成本汇总（MVP）——必须列齐全；表头按现有 CSV 契约校验。
+PERSONAL_COST_COLUMNS = [
+    "工厂", "产品名称", "产品规格", "月份", "产量(盒)",
+    "直接材料(元/盒)", "直接人工(元/盒)", "制造费用(元/盒)",
+    "单位成本(元/盒)", "总成本(元)",
+]
+PERSONAL_NUM_COLUMNS = [
+    "产量(盒)", "直接材料(元/盒)", "直接人工(元/盒)",
+    "制造费用(元/盒)", "单位成本(元/盒)", "总成本(元)",
+]
 
 # 制造费用五类 ↔ 模板措辞。CSV 列名是「人工(间接)」，模板叫「间接人工」。
 #   [报告模板契约.md:3.3] 明确提示过这处名称映射。
@@ -98,6 +116,27 @@ def _pct(cur: Optional[float], prev: Optional[float]) -> Optional[float]:
     if cur is None or prev in (None, 0):
         return None
     return (cur - prev) / prev * 100.0
+
+
+def _finalize_sources(fs: FactSet) -> FactSet:
+    """把当前数据上下文的来源/警告写进 FactSet，供报告 stats/API 使用。"""
+    ctx = _REPORT_CTX.get()
+    if ctx is None:
+        fs.sources = {"scope": "shared"}
+        return fs
+    warnings = list(dict.fromkeys(ctx.warnings))
+    prefix = f"{fs.product}&"
+    keys = {k: v for k, v in ctx.personal_rows.items() if k.startswith(prefix)}
+    fs.warnings = warnings
+    fs.sources = {
+        "scope": "personal" if ctx.use_personal else "shared",
+        "personal_files": sorted(set(keys.values())),
+        "personal_keys": sorted(keys),
+        "overridden_keys": sorted(k for k in keys if k in ctx.overridden),
+        "ignored_rows": ctx.ignored_rows,
+        "warnings": warnings,
+    }
+    return fs
 
 
 # 行覆盖：让**季度/专题**分析能把"聚合后的合成行"喂进来，
@@ -141,6 +180,140 @@ def _read(name: str) -> List[Dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+def _read_cost_summary(year: int) -> List[Dict[str, str]]:
+    """
+    读共享成本汇总，并在个人模式下合并个人成本汇总行。
+
+    - 个人行按 `(产品名称, 月份)` 覆盖共享行；个人缺失的月份回退共享。
+    - 个人行必须列齐全、数值可解析、两条恒等式成立，否则抛 ValueError。
+    - 每行附加 `_source_name`，供事实坐标指向真实文件。
+    """
+    shared_name = f"csv/cost_data/中药一厂_成本汇总_{year}年1-6月.csv"
+    shared = _read(shared_name)
+    for r in shared:
+        r["_source_name"] = Path(shared_name).name
+
+    ctx = _REPORT_CTX.get()
+    if not ctx or not ctx.use_personal or not ctx.personal_root:
+        return shared
+
+    personal_dir = ctx.personal_root / "raw" / "csv" / "cost_data"
+    if not personal_dir.exists():
+        ctx.warnings.append("未找到个人 raw/csv/cost_data；已回退共享成本汇总")
+        return shared
+
+    personal: Dict[Tuple[str, str], Tuple[str, Dict[str, str]]] = {}
+    conflicts: List[str] = []
+    ignored_local = 0
+
+    for p in sorted(personal_dir.rglob("*.csv")):
+        try:
+            with open(p, encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                cols = [c for c in (reader.fieldnames or []) if c]
+                rows = list(reader)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"读取个人 CSV 失败：{p.name}：{type(e).__name__}: {e}")
+        missing_cols = [c for c in PERSONAL_COST_COLUMNS if c not in cols]
+        if missing_cols:
+            if "成本汇总" in p.name:
+                raise ValueError(
+                    f"个人文件 {p.name} 表头不匹配，缺少列：{'、'.join(missing_cols)}")
+            continue
+
+        for idx, row in enumerate(rows, start=2):
+            factory = (row.get("工厂") or "").strip()
+            if not factory:
+                raise ValueError(f"{p.name} 第 {idx} 行「工厂」为空")
+            if factory not in ("中药一厂", "中药二厂"):
+                raise ValueError(f"{p.name} 第 {idx} 行「工厂」非法：{factory}")
+            if factory == "中药二厂":
+                ignored_local += 1
+                continue
+
+            product = (row.get("产品名称") or "").strip()
+            if product not in UNIT_PER_BOX:
+                raise ValueError(
+                    f"{p.name} 第 {idx} 行产品不在现有 3 个产品内：{product or '(空)'}")
+            month = (row.get("月份") or "").strip()
+            if not re.fullmatch(r"\d{4}-\d{2}", month):
+                raise ValueError(f"{p.name} 第 {idx} 行月份格式非法：{month or '(空)'}")
+            if not month.startswith(f"{year}-"):
+                continue
+
+            nums: Dict[str, float] = {}
+            for col in PERSONAL_NUM_COLUMNS:
+                v = _num(row.get(col))
+                if v is None:
+                    raise ValueError(
+                        f"{p.name} 第 {idx} 行 {product}/{month} 列「{col}」为空或非数字")
+                nums[col] = v
+
+            mat = nums["直接材料(元/盒)"]
+            lab = nums["直接人工(元/盒)"]
+            mfg = nums["制造费用(元/盒)"]
+            unit = nums["单位成本(元/盒)"]
+            output = nums["产量(盒)"]
+            total = nums["总成本(元)"]
+            if abs(mat + lab + mfg - unit) > 0.02:
+                raise ValueError(
+                    f"{p.name} 第 {idx} 行恒等式不成立："
+                    f"材料 {mat} + 人工 {lab} + 制造 {mfg} ≠ 单位成本 {unit}")
+            if abs(output * unit - total) > 0.02:
+                raise ValueError(
+                    f"{p.name} 第 {idx} 行恒等式不成立："
+                    f"产量 {output} × 单位成本 {unit} ≠ 总成本 {total}")
+
+            spec = (row.get("产品规格") or "").strip()
+            if spec and PRODUCT_SPEC.get(product) and spec != PRODUCT_SPEC[product]:
+                ctx.warnings.append(
+                    f"{p.name} {product} 规格「{spec}」与现有「{PRODUCT_SPEC[product]}」不一致")
+
+            key = (product, month)
+            if key in personal:
+                prev_file, _ = personal[key]
+                conflicts.append(f"{product}/{month}: {prev_file} 与 {p.name}")
+            else:
+                personal[key] = (p.name, dict(row))
+                ctx.personal_files.add(p.name)
+                ctx.personal_rows[f"{product}&{month}"] = p.name
+
+    if conflicts:
+        raise ValueError("个人成本汇总存在重复的产品/月份：" + "；".join(conflicts[:10]))
+    ctx.ignored_rows = max(ctx.ignored_rows, ignored_local)
+    if ctx.ignored_rows and not any("中药二厂" in w for w in ctx.warnings):
+        ctx.warnings.append(
+            f"忽略 {ctx.ignored_rows} 行中药二厂数据（MVP 只支持一厂）")
+    if not personal:
+        ctx.warnings.append(f"个人成本汇总未提供 {year} 年数据；已回退共享")
+        return shared
+
+    shared_keys = {
+        ((r.get("产品名称") or "").strip(), (r.get("月份") or "").strip()): r
+        for r in shared
+    }
+    by_key: Dict[Tuple[str, str], Dict[str, str]] = dict(shared_keys)
+    for key, (fname, row) in personal.items():
+        if key in shared_keys:
+            ctx.overridden.add(f"{key[0]}&{key[1]}")
+        r = dict(row)
+        r["_source_name"] = fname
+        by_key[key] = r
+
+    out: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for r in shared:
+        k = ((r.get("产品名称") or "").strip(), (r.get("月份") or "").strip())
+        if k in by_key and k not in seen:
+            out.append(by_key[k])
+            seen.add(k)
+    for k in sorted(by_key):
+        if k not in seen:
+            out.append(by_key[k])
+            seen.add(k)
+    return out
+
+
 def _pick(rows: List[Dict[str, str]], **kw) -> Optional[Dict[str, str]]:
     for r in rows:
         if all((r.get(k) or "").strip() == str(v) for k, v in kw.items()):
@@ -164,6 +337,42 @@ class Fact:
 
 
 @dataclass
+class ReportDataContext:
+    """一次报告生成的数据根与个人覆盖状态（contextvar，线程/协程安全）。"""
+    shared_root: Path
+    personal_root: Optional[Path] = None
+    use_personal: bool = False
+    personal_files: Set[str] = field(default_factory=set)
+    personal_rows: Dict[str, str] = field(default_factory=dict)  # "产品&月份" -> 文件
+    overridden: Set[str] = field(default_factory=set)
+    ignored_rows: int = 0
+    warnings: List[str] = field(default_factory=list)
+
+
+_REPORT_CTX: contextvars.ContextVar[Optional[ReportDataContext]] = \
+    contextvars.ContextVar("report_data_context", default=None)
+
+
+@contextmanager
+def report_context(shared_root: Optional[Path] = None,
+                   personal_root: Optional[Path] = None,
+                   use_personal: bool = False):
+    """设置一次报告取数的数据上下文；退出时恢复。默认 = 共享基线。"""
+    ctx = ReportDataContext(
+        shared_root=Path(shared_root) if shared_root else WIKI_ROOT,
+        personal_root=Path(personal_root) if personal_root else None,
+        use_personal=bool(use_personal and personal_root),
+    )
+    if use_personal and not personal_root:
+        ctx.warnings.append("use_personal=True 但未提供 personal_root；已回退共享")
+    token = _REPORT_CTX.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _REPORT_CTX.reset(token)
+
+
+@dataclass
 class FactSet:
     product: str
     month: str
@@ -176,6 +385,8 @@ class FactSet:
     peer: List[Dict[str, Any]] = field(default_factory=list)       # 对标
     missing: List[str] = field(default_factory=list)
     conflicts: List[str] = field(default_factory=list)             # 已知不可自洽点
+    sources: Dict[str, Any] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -210,8 +421,8 @@ def _shift_month(month: str, delta: int) -> Optional[str]:
 
 def build(product: str, month: str) -> FactSet:
     """算出某产品某月的全部报告事实。"""
-    m26 = _read("csv/cost_data/中药一厂_成本汇总_2026年1-6月.csv")
-    m25 = _read("csv/cost_data/中药一厂_成本汇总_2025年1-6月.csv")
+    m26 = _read_cost_summary(2026)
+    m25 = _read_cost_summary(2025)
     bud = _read("csv/cost_data/中药一厂_预算数据_2026年.csv")
     lab = _read("csv/cost_data/中药一厂_人工工时明细_2026年1-6月.csv")
     mfg = _read("csv/cost_data/中药一厂_制造费用明细_2026年1-6月.csv")
@@ -232,12 +443,17 @@ def build(product: str, month: str) -> FactSet:
     add = fs.facts.__setitem__
     if product not in UNIT_PER_BOX:
         fs.missing.append(f"未知产品: {product}")
-        return fs
+        return _finalize_sources(fs)
 
     cur = _pick(m26, 产品名称=product, 月份=month)
     prev = _pick(m26, 产品名称=product, 月份=fs.prev_month)
     yago = _pick(m25, 产品名称=product, 月份=fs.year_ago_month)
     budr = _pick(bud, 产品名称=product, 月份=month)
+
+    # 成本汇总行的真实来源（个人覆盖时指向个人文件）
+    S_CUR = (cur or {}).get("_source_name", F26)
+    S_PREV = (prev or {}).get("_source_name", F26)
+    S_YA = (yago or {}).get("_source_name", F25)
 
     # 实际有 9/10 月简报（一厂），但该简报只含单位成本 → 单独处理，见 brief
     if cur is None:
@@ -255,14 +471,14 @@ def build(product: str, month: str) -> FactSet:
         key = col
         rng = f"{product}&{month}"
         if c is not None:
-            add(key, Fact(c, _fmt(c, 0), "", _coord(F26, col, rng), F26))
+            add(key, Fact(c, _fmt(c, 0), "", _coord(S_CUR, col, rng), S_CUR))
         else:
             fs.missing.append(f"{label}（本月）")
         if p is not None:
-            add("上月" + key, Fact(p, _fmt(p, 0), "", _coord(F26, col, f"{product}&{fs.prev_month}"), F26))
+            add("上月" + key, Fact(p, _fmt(p, 0), "", _coord(S_PREV, col, f"{product}&{fs.prev_month}"), S_PREV))
         d = _pct(c, p)
         if d is not None:
-            add(key + "环比", Fact(d, f"{d:+.2f}%", "%", _coord(F26, col, rng), F26,
+            add(key + "环比", Fact(d, f"{d:+.2f}%", "%", _coord(S_CUR, col, rng), S_CUR,
                                    formula=f"({_fmt(c,0)} − {_fmt(p,0)}) ÷ {_fmt(p,0)}"))
 
     # 产量
@@ -278,15 +494,15 @@ def build(product: str, month: str) -> FactSet:
         #    硬编一个坐标等于**伪造溯源**，比留空更坏。
         add("本月单位成本", Fact(
             c, _fmt(c), "元/盒",
-            "" if _OVERRIDE is not None else _coord(F26, "单位成本(元/盒)", f"{product}&{month}"),
-            F26,
+            "" if _OVERRIDE is not None else _coord(S_CUR, "单位成本(元/盒)", f"{product}&{month}"),
+            S_CUR,
             formula="总成本 ÷ 总产量（期间聚合）" if _OVERRIDE is not None else None))
     if p is not None:
         add("上月单位成本", Fact(p, _fmt(p), "元/盒",
-            _coord(F26, "单位成本(元/盒)", f"{product}&{fs.prev_month}"), F26))
+            _coord(S_PREV, "单位成本(元/盒)", f"{product}&{fs.prev_month}"), S_PREV))
     if ya is not None:
         add("去年单位成本", Fact(ya, _fmt(ya), "元/盒",
-            _coord(F25, "单位成本(元/盒)", f"{product}&{fs.year_ago_month}"), F25))
+            _coord(S_YA, "单位成本(元/盒)", f"{product}&{fs.year_ago_month}"), S_YA))
     if bv is not None:
         add("预算单位成本", Fact(bv, _fmt(bv), "元/盒",
             _coord(FB, "预算单位成本(元/盒)", f"{product}&{month}"), FB))
@@ -295,8 +511,8 @@ def build(product: str, month: str) -> FactSet:
         v = _pct(num, den)
         if v is not None:
             add(key, Fact(v, f"{v:+.2f}%", "%",
-                          _coord(F26, "单位成本(元/盒)", f"{product}&{month}"),
-                          F26, formula=f"({_fmt(num)} − {_fmt(den)}) ÷ {_fmt(den)}"))
+                          _coord(S_CUR, "单位成本(元/盒)", f"{product}&{month}"),
+                          S_CUR, formula=f"({_fmt(num)} − {_fmt(den)}) ÷ {_fmt(den)}"))
 
     # 总成本
     tc = raw(m26, cur, "总成本(元)", F26, "")
@@ -304,9 +520,9 @@ def build(product: str, month: str) -> FactSet:
     ty = raw(m25, yago, "总成本(元)", F25, "")
     tb = raw(bud, budr, "预算总成本(元)", FB, "")
     for key, val, unit, tbl, tag in (
-            ("本月总成本", tc, "元", F26, f"{product}&{month}"),
-            ("上月总成本", tp, "元", F26, f"{product}&{fs.prev_month}"),
-            ("去年总成本", ty, "元", F25, f"{product}&{fs.year_ago_month}"),
+            ("本月总成本", tc, "元", S_CUR, f"{product}&{month}"),
+            ("上月总成本", tp, "元", S_PREV, f"{product}&{fs.prev_month}"),
+            ("去年总成本", ty, "元", S_YA, f"{product}&{fs.year_ago_month}"),
             ("预算总成本", tb, "元", FB, f"{product}&{month}")):
         if val is not None:
             add(key, Fact(val, _fmt(val, 0), unit,
@@ -315,23 +531,23 @@ def build(product: str, month: str) -> FactSet:
                           ("总成本预算偏差", tc, tb)):
         v = _pct(num, den)
         if v is not None:
-            add(key, Fact(v, f"{v:+.2f}%", "%", _coord(F26, "总成本(元)", f"{product}&{month}"),
-                          F26, formula=f"({_fmt(num,0)} − {_fmt(den,0)}) ÷ {_fmt(den,0)}"))
+            add(key, Fact(v, f"{v:+.2f}%", "%", _coord(S_CUR, "总成本(元)", f"{product}&{month}"),
+                          S_CUR, formula=f"({_fmt(num,0)} − {_fmt(den,0)}) ÷ {_fmt(den,0)}"))
 
     # 产量同比/预算偏差（产量环比已由 three() 产出）
     pv = raw(m26, cur, "产量(盒)", F26, "")
     pp = raw(m26, prev, "产量(盒)", F26, "")
     py = raw(m25, yago, "产量(盒)", F25, "")
     pb = raw(bud, budr, "预算产量(盒)", FB, "")
-    for key, val, tbl, tag in (("去年同月产量", py, F25, f"{product}&{fs.year_ago_month}"),
+    for key, val, tbl, tag in (("去年同月产量", py, S_YA, f"{product}&{fs.year_ago_month}"),
                                ("预算产量", pb, FB, f"{product}&{month}")):
         if val is not None:
-            add(key, Fact(val, _fmt(val, 0), "盒", _coord(tbl, "产量(盒)" if tbl == F25 else "预算产量(盒)", tag), tbl))
+            add(key, Fact(val, _fmt(val, 0), "盒", _coord(tbl, "产量(盒)" if tbl == S_YA else "预算产量(盒)", tag), tbl))
     for key, num, den in (("产量同比", pv, py), ("产量预算偏差", pv, pb)):
         v = _pct(num, den)
         if v is not None:
-            add(key, Fact(v, f"{v:+.2f}%", "%", _coord(F26, "产量(盒)", f"{product}&{month}"),
-                          F26, formula=f"({_fmt(num,0)} − {_fmt(den,0)}) ÷ {_fmt(den,0)}"))
+            add(key, Fact(v, f"{v:+.2f}%", "%", _coord(S_CUR, "产量(盒)", f"{product}&{month}"),
+                          S_CUR, formula=f"({_fmt(num,0)} − {_fmt(den,0)}) ÷ {_fmt(den,0)}"))
 
     # 三要素（本月/上月/环比/预算/偏差）
     for col, tag, name in (("直接材料(元/盒)", "材料", "材料"), ("直接人工(元/盒)", "人工", "人工"),
@@ -341,22 +557,22 @@ def build(product: str, month: str) -> FactSet:
         cb = raw(bud, budr, "预算" + col, FB, "")
         if cc is not None:
             add(f"本月{tag}成本", Fact(cc, _fmt(cc), "元/盒",
-                _coord(F26, col, f"{product}&{month}"), F26))
+                _coord(S_CUR, col, f"{product}&{month}"), S_CUR))
         if cp is not None:
             add(f"上月{tag}成本", Fact(cp, _fmt(cp), "元/盒",
-                _coord(F26, col, f"{product}&{fs.prev_month}"), F26))
+                _coord(S_PREV, col, f"{product}&{fs.prev_month}"), S_PREV))
         if cb is not None:
             add(f"预算{tag}成本", Fact(cb, _fmt(cb), "元/盒",
                 _coord(FB, "预算" + col, f"{product}&{month}"), FB))
         v = _pct(cc, cp)
         if v is not None:
             add(f"{name}成本环比" if name != "制造费用" else "制造费用环比",
-                Fact(v, f"{v:+.2f}%", "%", _coord(F26, col, f"{product}&{month}"), F26,
+                Fact(v, f"{v:+.2f}%", "%", _coord(S_CUR, col, f"{product}&{month}"), S_CUR,
                      formula=f"({_fmt(cc)} − {_fmt(cp)}) ÷ {_fmt(cp)}"))
         v = _pct(cc, cb)
         if v is not None:
             add(f"{name}预算偏差", Fact(v, f"{v:+.2f}%", "%",
-                _coord(F26, col, f"{product}&{month}"), F26,
+                _coord(S_CUR, col, f"{product}&{month}"), S_CUR,
                 formula=f"({_fmt(cc)} − {_fmt(cb)}) ÷ {_fmt(cb)}"))
 
     # ---- 2.2 成本结构（占比 + 贡献度）----
@@ -372,11 +588,11 @@ def build(product: str, month: str) -> FactSet:
         tot = dc + lc + mc
         for tag, val in (("材料", dc), ("人工", lc), ("制造费用", mc)):
             add(f"{tag}金额", Fact(val, _fmt(val), "元/盒",
-                _coord(F26, f"直接{'材料' if tag=='材料' else '人工' if tag=='人工' else ''}(元/盒)"
-                       if tag != "制造费用" else "制造费用(元/盒)", f"{product}&{month}"), F26))
+                _coord(S_CUR, f"直接{'材料' if tag=='材料' else '人工' if tag=='人工' else ''}(元/盒)"
+                       if tag != "制造费用" else "制造费用(元/盒)", f"{product}&{month}"), S_CUR))
             if tot:
                 add(f"{tag}占比", Fact(val / tot * 100, f"{val/tot*100:.2f}%", "%",
-                    _coord(F26, "单位成本(元/盒)", f"{product}&{month}"), F26,
+                    _coord(S_CUR, "单位成本(元/盒)", f"{product}&{month}"), S_CUR,
                     formula=f"{_fmt(val)} ÷ {_fmt(tot)}"))
         delta_tot = (dc + lc + mc) - ((dp or 0) + (lp or 0) + (mp or 0)) if None not in (dp, lp, mp) else None
         if delta_tot:
@@ -385,7 +601,7 @@ def build(product: str, month: str) -> FactSet:
                     continue
                 d = c0 - p0
                 add(f"{tag}贡献度", Fact(d / delta_tot * 100, f"{d/delta_tot*100:.2f}%", "%",
-                    _coord(F26, "单位成本(元/盒)", f"{product}&{month}"), F26,
+                    _coord(S_CUR, "单位成本(元/盒)", f"{product}&{month}"), S_CUR,
                     formula=f"({_fmt(c0)} − {_fmt(p0)}) ÷ {_fmt(delta_tot)}"))
 
     # ---- 3.2 直接人工四指标 ----
@@ -544,7 +760,7 @@ def build(product: str, month: str) -> FactSet:
     #    与眼前数字毫无关系的断言。而且它是"看起来对"的错，校验器拦不住。
     fs.conflicts.extend(_data_conflicts())
 
-    return fs
+    return _finalize_sources(fs)
 
 
 # 口径说明文件：缺失即为空，不报错（老工作区没有这个文件也要能跑）

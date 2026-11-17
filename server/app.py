@@ -116,12 +116,22 @@ def health() -> Dict[str, Any]:
         if not (p.suffix.lower() == ".txt"
                 and any(p.with_suffix(e).exists() for e in BINARY))
     ]
+    try:
+        import retrieval
+        rstatus = retrieval.vector_status(root=WIKI_ROOT)
+        err = retrieval.last_vector_error()
+        if err:
+            rstatus["last_error"] = err
+    except Exception as e:  # noqa: BLE001
+        rstatus = {"vector": False, "reason": f"{type(e).__name__}: {e}"}
+
     return {
         "ok": True,
         "articles": n_wiki,
         "sources": len(sources),          # 用户视角：多少份原始资料
         "raw_files": len(raw_files),
         "reports": len(list(REPORTS.glob("*.md"))) if REPORTS.exists() else 0,
+        "retrieval": rstatus,
     }
 
 
@@ -214,6 +224,63 @@ def forecast_api(product: str = Query(...), horizon: int = Query(2, ge=1, le=6),
         # 让前端不必自己拼这句话——口径统一由服务端给
         "method": "Holt 线性趋势（非季节性模型）",
     }
+
+
+@app.get("/api/forecast/scenarios", summary="历史情景成本预测（加分项）")
+def forecast_scenarios_api(product: str = Query(...),
+                           as_of: Optional[str] = Query(None),
+                           authorization: str = Header(default=""),
+                           lw_sid: str = Cookie(default="")) -> Dict[str, Any]:
+    """
+    基于历史月度成本 + 材料行情联合情景，预测下月单位成本。
+
+    ⚠️ 这是**外推**，没有 raw 坐标；区间是历史情景的最小/最大范围，
+       不是统计置信区间。前端必须展示 `warnings`，不得当成承诺值。
+    """
+    import forecast_scenarios as FS
+
+    try:
+        result = FS.forecast(product, as_of=as_of)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "product": product,
+                "error": f"{type(e).__name__}: {e}"}
+
+    def r3(v: Any) -> Optional[float]:
+        return None if v is None else round(float(v), 3)
+
+    history: List[Dict[str, Any]] = []
+    n_samples = 0
+    try:
+        fs = RF.build(product, as_of or "2026-05")
+        history = [{"月份": r["月份"],
+                    "单位成本": RF._num(r.get("单位成本"))}
+                   for r in fs.monthly
+                   if RF._num(r.get("单位成本")) is not None]
+        n_samples = len(history)
+    except Exception:  # noqa: BLE001
+        pass
+
+    result["ok"] = True
+    result["method"] = "历史情景概率模型（近期加权）"
+    result["expected_unit_cost"] = r3(result.get("expected_unit_cost"))
+    result["scenario_range"] = {
+        k: r3(v) for k, v in (result.get("scenario_range") or {}).items()
+    }
+    result["component_expectations"] = {
+        k: r3(v) for k, v in (result.get("component_expectations") or {}).items()
+    }
+    result["scenarios"] = [
+        {**s,
+         "material": r3(s.get("material")),
+         "labor": r3(s.get("labor")),
+         "overhead": r3(s.get("overhead")),
+         "unit_cost": r3(s.get("unit_cost"))}
+        for s in (result.get("scenarios") or [])
+    ]
+    result["history"] = history
+    result["n_samples"] = n_samples
+    result["scope"] = "shared"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +689,63 @@ def _parse_timeline() -> List[Dict[str, Any]]:
     return entries
 
 
+def _timeline_from_audit() -> List[Dict[str, Any]]:
+    """
+    `wiki/log.md` 不存在时的兜底：从采集审计日志生成更新记录。
+
+    ⚠️ 这不是伪造时间线。`ingest_raw.py` 每采集一份文件都会写一条
+       `raw/.ingest-audit.jsonl`；这里只是把它按「日期 × 主题」聚合，
+       让用户看到的是「某天纳入了哪类资料」，而不是 19 条重复流水。
+    """
+    p = WIKI_ROOT / "raw" / ".ingest-audit.jsonl"
+    if not p.exists():
+        return []
+    groups: Dict[tuple, int] = {}
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("event") != "collected" or e.get("is_duplicate"):
+            continue
+        # 采集后被人为移动/删除的文件不计入——时间线说「现在还在的资料」，
+        # 不说「当时曾经落过位的资料」。
+        rp = str(e.get("raw_path") or "")
+        if rp and not (WIKI_ROOT / rp).exists():
+            continue
+        date = str(e.get("at") or "")[:10]
+        topic = str(e.get("topic") or "docs")
+        if date:
+            groups[(date, topic)] = groups.get((date, topic), 0) + 1
+
+    LABEL = {
+        "csv/cost_data": "成本明细数据",
+        "csv/market_data": "行业参考数据",
+        "pdf/pharma_docs": "制药知识文档",
+        "templates": "报告模板",
+        "rpa": "RPA 接口文档",
+        "meta": "数据包元信息",
+        "docs": "其他资料",
+        "tabular": "表格资料",
+    }
+    items: List[Dict[str, Any]] = []
+    for (date, topic), n in sorted(groups.items()):
+        label = LABEL.get(topic, "其他资料")
+        items.append({
+            "date": date,
+            "kind": "ingest",
+            "title": f"纳入{label} {n} 份",
+            "excerpt": f"来源：{label}；已归档到原始资料库，可在检索与报告中引用。",
+            "disposition": "新增",
+            "files": [],
+        })
+    return items
+
+
 @app.get("/api/timeline", summary="数据更新记录")
 def timeline() -> Dict[str, Any]:
     """
@@ -633,8 +757,11 @@ def timeline() -> Dict[str, Any]:
     """
     # 面向用户的事件类型：纳入资料 / 校核 / 修正 / 规则调整
     USER_FACING = {"ingest", "lint", "fix", "skill"}
-    items = [i for i in _parse_timeline() if i.get("kind") in USER_FACING]
-    items = [_polish_timeline(i) for i in items]
+    raw = [i for i in _parse_timeline() if i.get("kind") in USER_FACING]
+    if not raw:
+        # 还没编译 wiki（没有 log.md）时，用采集审计日志兜底。
+        raw = _timeline_from_audit()
+    items = [_polish_timeline(i) for i in raw]
     return {"count": len(items), "items": items}
 
 
@@ -782,24 +909,31 @@ def search(q: str = Query(..., min_length=1), top_k: int = Query(6, ge=1, le=20)
 
     try:
         import retrieval
-        # 先确保索引覆盖当前语料（含个人层）。hybrid_search 内部也会查覆盖率，
-        # 这里显式建一次，让"个人块缺向量"在入口就被修掉。
-        idx = None
-        try:
-            idx = retrieval.build_index(verbose=False, root=WIKI_ROOT, **ov)
-        except Exception:  # noqa: BLE001
-            idx = None               # 离线/无 key 时退回只用 BM25
+        # hybrid_search 内部会检查覆盖率并按需重建；不再在入口先建一次，
+        # 避免重复 embedding。失败原因由 last_vector_error() 带回。
         hits = retrieval.hybrid_search(q, top_k=top_k, root=WIKI_ROOT,
-                                       index=idx, allow_online=idx is None, **ov)
+                                       allow_online=True, **ov)
+        vstatus = retrieval.vector_status(root=WIKI_ROOT)
+        hybrid = any(getattr(h, "vec_rank", None) is not None for h in hits)
+        if not hits:
+            hybrid = bool(vstatus.get("vector"))
         return {"query": q, "count": len(hits),
                 "scope": "shared+personal" if info else "shared",
+                "mode": "hybrid" if hybrid else "bm25",
+                "vector_error": retrieval.last_vector_error() or None,
                 "hits": [{"article": getattr(h.chunk, "article", ""),
                           "section": getattr(h.chunk, "section", ""),
                           "source": getattr(h.chunk, "source", "shared"),
                           "text": getattr(h.chunk, "text", "")[:400],
-                          "score": getattr(h, "rrf", None)} for h in hits]}
+                          "score": getattr(h, "rrf", None),
+                          "rrf": getattr(h, "rrf", None),
+                          "bm25_rank": getattr(h, "bm25_rank", None),
+                          "vec_rank": getattr(h, "vec_rank", None),
+                          "cosine": getattr(h, "cosine", None)} for h in hits]}
     except Exception as e:  # noqa: BLE001
-        return {"query": q, "count": 0, "hits": [], "error": f"{type(e).__name__}: {e}"}
+        return {"query": q, "count": 0, "hits": [], "mode": "bm25",
+                "vector_error": f"{type(e).__name__}: {e}",
+                "error": f"{type(e).__name__}: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +947,8 @@ _GRAPH_TYPE_ZH = {
     "product": "产品", "material": "原料", "process": "工序",
     "equipment": "设备", "incident": "故障", "anomaly": "成本异动",
     "peer": "对标",
+    # raw 确定性图谱新增的三类节点
+    "factory": "工厂", "cost": "成本要素", "market": "行情药材",
 }
 
 
@@ -893,13 +1029,31 @@ def graph(focus: str = Query("", description="只取该实体 N 跳内的子图�
        按实体聚焦是**可读性**的必要条件，不是可选优化。
     """
     p = WIKI_ROOT / "graph" / "graph.json"
-    if not p.exists():
-        return {"ok": False, "error": "图谱尚未构建（跑 python scripts/graph_build.py）",
-                "nodes": [], "edges": []}
-    try:
-        g = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        return {"ok": False, "error": f"图谱不可读：{type(e).__name__}",
+
+    def _load() -> Optional[Dict[str, Any]]:
+        try:
+            g = json.loads(p.read_text(encoding="utf-8"))
+            return g if g.get("nodes") else None
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    g = _load()
+    if g is None:
+        # wiki 图谱不存在（没跑 LLM 编译）时，退回到 raw 的确定性构图。
+        # 这不是降级成假数据：节点/边全部来自 raw CSV 与 PDF 派生文本，
+        # 且每个节点都带 raw 坐标。图谱只回答「谁连谁」，不做归因。
+        try:
+            import graph_build_raw
+            graph_build_raw.build(verbose=False)
+            g = _load()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False,
+                    "error": f"图谱尚未构建，且自动从 raw 构图失败："
+                             f"{type(e).__name__}: {e}",
+                    "nodes": [], "edges": []}
+    if g is None:
+        return {"ok": False,
+                "error": "图谱尚未构建：raw/ 下没有可构图的数据",
                 "nodes": [], "edges": []}
 
     nodes = {n["id"]: n for n in g.get("nodes", [])}
@@ -1744,6 +1898,11 @@ class GenerateIn(BaseModel):
     month: str = "2026-06"
     theme: str = "monthly"
     period: str = ""
+    # 赛题 5.1.1：填 Word 模板时传模板文件名（仅月度）。
+    # 空字符串 = 走默认 .md 模板，产出 markdown 后再导出 Word/PDF。
+    template_docx: str = ""
+    # 个人成本汇总 MVP：显式启用个人数据；产物写个人工作区，不混共享。
+    use_personal: bool = False
 
 
 @app.get("/api/themes", summary="可选的分析主题")
@@ -1776,6 +1935,28 @@ def control_generate(body: GenerateIn,
     info = _whoami(authorization, lw_sid)
     if body.theme not in ("monthly", "quarterly", "topic"):
         raise HTTPException(400, f"未知分析主题：{body.theme}")
+
+    personal = bool(body.use_personal)
+    if personal and body.theme != "monthly":
+        raise HTTPException(400, "使用个人上传数据目前只支持月度分析")
+    ws = _ws(info["external_id"]) if personal else None
+    out_dir = (ws / "reports") if personal else REPORTS
+    if personal:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 赛题 5.1.1：填 Word 模板。模板本身是月度结构，故只在月度主题下开放。
+    use_docx = bool(body.template_docx)
+    tpl_path: Optional[Path] = None
+    if use_docx:
+        if body.theme != "monthly":
+            raise HTTPException(400, "Word 模板目前只支持月度分析")
+        base = (WIKI_ROOT / "raw" / "templates").resolve()
+        tpl_path = (base / Path(body.template_docx).name).resolve()
+        if (not tpl_path.is_relative_to(base)
+                or not tpl_path.is_file()
+                or tpl_path.suffix.lower() != ".docx"):
+            raise HTTPException(400, "Word 模板不存在或格式不正确")
+
     import period_agg as PA
 
     if body.theme == "quarterly":
@@ -1790,17 +1971,68 @@ def control_generate(body: GenerateIn,
     else:
         out_name = f"{body.product}_{body.month}.md"
 
+    import importlib.util
     import report_build as RB
+
+    # 没有 Key 或没有装 LangChain 时，不再直接 500：退回确定性填充。
+    # 数字/表格仍然完整，只是 AI 归因、建议等段落缺失——
+    # 报告顶部会明确标注「演示模式」，不假装是完整产物。
+    has_llm = (bool(os.getenv("DEEPSEEK_API_KEY"))
+               and importlib.util.find_spec("langchain_openai") is not None)
+    degraded = not has_llm
     try:
-        r = RB.build(body.product, body.month, use_llm=True, verbose=False,
-                     theme=body.theme, period=body.period)
+        docx_out = (str(out_dir / f"{body.product}_{body.month}.docx")
+                    if use_docx else None)
+        r = RB.build(body.product, body.month, use_llm=has_llm, verbose=False,
+                     theme=body.theme, period=body.period,
+                     template_docx=str(tpl_path) if use_docx else None,
+                     docx_out_path=docx_out,
+                     use_personal=personal, personal_root=ws, out_dir=out_dir)
+    except ValueError as e:
+        if personal:
+            raise HTTPException(400, f"个人数据校验失败：{e}")
+        raise HTTPException(500, f"生成失败：{type(e).__name__}: {e}")
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"生成失败：{type(e).__name__}: {e}")
 
-    out = REPORTS / out_name
+    scope = "personal" if personal else "shared"
+    sources = (r.get("stats") or {}).get("sources")
+    warnings = (r.get("stats") or {}).get("warnings") or []
+
+    # Word 模板模式：产物是 <out_dir>/<产品>_<月>.docx，不再写 markdown。
+    if use_docx:
+        docx_path = Path(r.get("docx") or "")
+        if not docx_path.is_file():
+            raise HTTPException(500, "Word 模板生成失败：未产出 docx")
+        if personal and not docx_path.resolve().is_relative_to(out_dir.resolve()):
+            raise HTTPException(500, "个人报告输出路径异常")
+        return {"ok": True, "file": docx_path.name, "docx": True,
+                "template": tpl_path.name, "theme": body.theme,
+                "scope": scope, "sources": sources, "warnings": warnings,
+                "degraded": degraded,
+                "message": ("未配置模型 Key，已生成确定性数据版 Word"
+                            "（AI 分析段落未生成）" if degraded else ""),
+                "stats": r["stats"]}
+
+    text = r["report"]
+    if degraded:
+        note = ("**演示模式**：当前未配置大模型 Key，本报告只包含确定性数据与表格；"
+                "AI 归因叙述未生成，改进建议与整改任务由规则生成。")
+        lines = text.splitlines()
+        # 标题必须留在第一行——模板契约/导出都以它为报告标题。
+        if lines and lines[0].startswith("# "):
+            text = lines[0] + "\n\n> " + note + "\n\n" + "\n".join(lines[1:]).lstrip("\n")
+        else:
+            text = "> " + note + "\n\n" + text
+
+    out = out_dir / out_name
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(r["report"], encoding="utf-8", newline="\n")
+    out.write_text(text, encoding="utf-8", newline="\n")
     return {"ok": True, "file": out_name, "theme": body.theme,
+            "scope": scope, "sources": sources, "warnings": warnings,
+            "degraded": degraded,
+            "message": ("未配置模型 Key，已生成确定性数据版报告"
+                        "（AI 分析段落未生成）" if degraded else ""),
             "stats": r["stats"]}
 
 
@@ -1816,6 +2048,92 @@ def control_exports(authorization: str = Header(default=""), lw_sid: str = Cooki
     reps = sorted(REPORTS.glob("*.md")) if REPORTS.exists() else []
     return {"reports": [{"name": p.name, "stem": p.stem,
                          "size": p.stat().st_size} for p in reps]}
+
+
+@app.get("/api/control/download", summary="下载生成的 Word/PDF")
+def control_download(name: str,
+                     authorization: str = Header(default=""),
+                     lw_sid: str = Cookie(default="")) -> FileResponse:
+    """下载 Word 模板生成的 .docx（或已导出的 .pdf）。
+
+    只允许 reports/ 下的文件名，且后缀白名单——防止路径穿越。
+    """
+    _whoami(authorization, lw_sid)
+    p = REPORTS / Path(name).name
+    if not p.is_file() or p.suffix.lower() not in (".docx", ".pdf"):
+        raise HTTPException(404, f"文件不存在：{name}")
+    return FileResponse(str(p), filename=p.name)
+
+
+@app.get("/api/control/my-reports", summary="我的个人报告")
+def control_my_reports(authorization: str = Header(default=""),
+                       lw_sid: str = Cookie(default="")) -> Dict[str, Any]:
+    """只列当前用户 ws/reports 下的 md/docx，不混共享 reports。"""
+    info = _whoami(authorization, lw_sid)
+    d = _ws(info["external_id"]) / "reports"
+    items = []
+    if d.exists():
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() in (".md", ".docx"):
+                items.append({"name": p.name, "stem": p.stem,
+                              "size": p.stat().st_size,
+                              "kind": p.suffix.lower().lstrip(".")})
+    return {"count": len(items), "items": items}
+
+
+@app.get("/api/control/my-download", summary="下载我的个人报告")
+def control_my_download(name: str,
+                        authorization: str = Header(default=""),
+                        lw_sid: str = Cookie(default="")) -> FileResponse:
+    """只允许当前用户 ws/reports 下的 md/docx。"""
+    info = _whoami(authorization, lw_sid)
+    base = (_ws(info["external_id"]) / "reports").resolve()
+    p = (base / Path(name).name).resolve()
+    if (not p.is_file()
+            or p.suffix.lower() not in (".md", ".docx")
+            or not p.is_relative_to(base)):
+        raise HTTPException(404, f"文件不存在：{name}")
+    return FileResponse(str(p), filename=p.name)
+
+
+@app.post("/api/control/my-export", summary="导出我的个人报告为 Word/PDF")
+def control_my_export(body: ExportIn,
+                      authorization: str = Header(default=""),
+                      lw_sid: str = Cookie(default="")) -> FileResponse:
+    """个人 Markdown 报告 → Word/PDF（含图），产物写个人 ws/exports。"""
+    import export_doc
+    import report_facts as RF
+
+    info = _whoami(authorization, lw_sid)
+    ws = _ws(info["external_id"])
+    if body.kind != "report":
+        raise HTTPException(400, f"未知的导出类型：{body.kind}")
+    name = Path(body.md).name
+    if not name or Path(name).suffix.lower() != ".md":
+        raise HTTPException(400, "个人导出只支持 .md 报告")
+    base = (ws / "reports").resolve()
+    src = (base / name).resolve()
+    if not src.is_file() or not src.is_relative_to(base):
+        raise HTTPException(404, f"源文件不存在：{name}")
+    if body.fmt not in ("docx", "pdf", "both"):
+        raise HTTPException(400, "fmt 只能是 docx / pdf / both")
+
+    out_dir = ws / "exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with RF.report_context(personal_root=ws, use_personal=True):
+            outs = export_doc.export(src, body.fmt, out_dir,
+                                     title=body.title or src.stem,
+                                     with_charts=body.charts)
+    except ValueError as e:
+        raise HTTPException(400, f"个人数据校验失败：{e}")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"导出失败：{type(e).__name__}: {e}")
+
+    pick = next((p for p in outs if p.suffix == ".pdf"), outs[0])
+    media = {"docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+             "pdf": "application/pdf"}[pick.suffix.lstrip(".")]
+    return FileResponse(str(pick), media_type=media, filename=pick.name)
 
 
 @app.post("/api/control/export", summary="导出 Word/PDF")

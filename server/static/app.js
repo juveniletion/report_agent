@@ -142,7 +142,13 @@ function HeroStat({ label, value, unit, index }) {
 function HeroStats({ health, notes }) {
   const items = [
     { label: "COVERED PRODUCTS", value: 3, unit: "个" },
-    { label: "ANALYSIS WINDOW", value: 6, unit: "个月" },
+    {
+      label: "RETRIEVAL",
+      value: health && health.retrieval
+        ? (health.retrieval.vector ? "混合" : "BM25")
+        : "—",
+      unit: "",
+    },
     { label: "SOURCE DOCUMENTS", value: health ? health.sources : "—", unit: "份" },
     { label: "DATA NOTES", value: notes ? notes.count : 0, unit: "条" },
   ];
@@ -1798,12 +1804,23 @@ function Rectify({ me, onNeedLogin, onAuthed }) {
  *    这里和「上传区」的处理不同：上传区是滑到才看见的次要功能，
  *    而问答区在首屏——摆一个点了没反应的输入框比给张登录卡更让人困惑。
  * ========================================================================== */
+const ROUTE_LABEL = {
+  state: "① 库直答（0 token）",
+  small: "② 小模型（Qwen2.5-7B）",
+  large: "③ 大模型（DeepSeek）",
+  unavailable: "知识库镜像不可用",
+};
+const routeLabel = lv => ROUTE_LABEL[lv] || lv || "未知";
+
 function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
   const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [meta, setMeta] = useState(null);
   const [showTrace, setShowTrace] = useState({});
+  /* 多模型路由演示：开启后提问走 /api/route（三层阶梯），
+     而不是默认的 /api/chat（Agent 大模型）。回答不写入会话历史。 */
+  const [routeMode, setRouteMode] = useState(false);
   const boxRef = useRef(null);
   /* 多会话：当前会话 id 与列表。
    * ⚠️ `convId === null` 表示**尚未落库的新对话**——用户点了"新对话"但还没提问。
@@ -1919,6 +1936,27 @@ function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
       const c = m.slice(), i = c.length - 1;
       c[i] = Object.assign({}, c[i]); fn(c[i]); return c;
     });
+
+    /* 多模型路由演示：走 /api/route，不写会话历史。
+       返回 level（state/small/large）+ trace，前端显示走了哪一档。 */
+    if (routeMode) {
+      try {
+        const r = await api("/api/route", {
+          method: "POST",
+          body: { question: q },
+        });
+        if (r._error) throw new Error(r._error);
+        patch(t => {
+          t.content = r.answer || "";
+          t.route = { level: r.level, trace: r.trace || [],
+                      escalated: !!r.escalated };
+        });
+      } catch (e) {
+        patch(t => { t.err = "路由失败：" + String(e.message || e); });
+      }
+      setBusy(false);
+      return;
+    }
 
     try {
       /* SSE 流式：不能用 api()（那个会把响应读成 JSON）。 */
@@ -2042,6 +2080,18 @@ function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
                   onClick=${e => deleteConv(convId, e)}>删除</button>` : null}
       </div>
 
+      <div class="route-toggle-row">
+        <label class="route-toggle"
+               title="演示 router.py 的三层阶梯：库直答 → 小模型 → 大模型。回答不写入会话历史。">
+          <input type="checkbox" checked=${routeMode} disabled=${busy}
+                 onChange=${e => setRouteMode(e.target.checked)} />
+          多模型路由
+        </label>
+        ${routeMode ? html`<span class="route-hint">
+          演示：库直答 → 小模型 → 大模型；回答不写入会话历史
+        </span>` : null}
+      </div>
+
       <form class="askbar" onSubmit=${e => { e.preventDefault(); ask(input); }}>
         <span class="askbar-icon">💬</span>
         <input value=${input} disabled=${busy}
@@ -2095,6 +2145,18 @@ function HeroAsk({ me, onNeedLogin, onAuthed, health, notes }) {
                   </div>` : null}
                 ${m.compact ? html`<div class="compact-note">
                   为保持对话流畅，此前部分内容已归纳为摘要</div>` : null}
+                ${m.route ? html`
+                  <div class="route-line">
+                    <span class=${"route-badge " + (m.route.level || "")}>
+                      ${routeLabel(m.route.level)}
+                    </span>
+                    ${m.route.escalated ? html`
+                      <span class="route-note">小模型校验未过，已升级</span>` : null}
+                    <details class="route-trace">
+                      <summary>决策轨迹</summary>
+                      <pre>${(m.route.trace || []).join("\n")}</pre>
+                    </details>
+                  </div>` : null}
                 ${running
                   ? html`<div class="txt typing">
                       ${m.content || "正在查阅资料，请稍候…"}</div>`
@@ -2341,6 +2403,12 @@ function ReportGen({ me, onGenerated }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
+  const [word, setWord] = useState(false);
+  const [wordFile, setWordFile] = useState("");
+  const [usePersonal, setUsePersonal] = useState(false);
+  const [scope, setScope] = useState("shared");
+  const [sources, setSources] = useState(null);
+  const [personalFile, setPersonalFile] = useState("");
 
   const MONTHS = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"];
   const t = ((th && th.themes) || []).find(x => x.id === theme) || {};
@@ -2357,14 +2425,28 @@ function ReportGen({ me, onGenerated }) {
   }, [theme, th]);
 
   const gen = async () => {
-    setBusy(true); setMsg(""); setErr("");
+    setBusy(true); setMsg(""); setErr(""); setWordFile("");
+    setScope("shared"); setSources(null); setPersonalFile("");
     try {
       const r = await api("/api/control/generate", {
         method: "POST",
-        body: { product, month, theme, period },
+        body: {
+          product, month, theme, period,
+          template_docx: (word && theme === "monthly")
+            ? "月度成本分析报告模板.docx" : "",
+          use_personal: usePersonal && theme === "monthly",
+        },
       });
       if (r._error) throw new Error(r._error);
-      setMsg(r.message || `已生成 ${r.file}（${r.stats.deterministic_fields} 个确定性值）`);
+      setScope(r.scope || "shared");
+      setSources(r.sources || null);
+      if (r.docx) {
+        setWordFile(r.file);
+        setMsg(r.message || `已按 Word 模板生成 ${r.file}`);
+      } else {
+        if (r.scope === "personal") setPersonalFile(r.file);
+        setMsg(r.message || `已生成 ${r.file}（${(r.stats && r.stats.deterministic_fields) || 0} 个确定性值）`);
+      }
       onGenerated && onGenerated();
     } catch (e) { setErr("生成失败：" + String(e.message || e)); }
     setBusy(false);
@@ -2377,7 +2459,10 @@ function ReportGen({ me, onGenerated }) {
       <summary>按主题生成报告 <span class="hint">月度 / 季度 / 专题</span></summary>
       <p class="sec-sub" style=${{ marginTop: 12 }}>
         选择分析主题、期间与产品，系统自动生成完整报告（数字由脚本算，
-        叙述由大模型写）。生成后可到下方「导出文档」转成 Word / PDF。
+        叙述由大模型写）。勾选「使用 Word 模板」会直接填充赛题提供的 .docx，
+        保留原有字体与表格样式；不勾选则生成 .md，可在下方「导出文档」
+        转成 Word / PDF（含图）。勾选「使用我的上传数据」会把个人成本汇总
+        覆盖到共享基线（仅月度；缺失月份回退共享）。
       </p>
       <div class="toolbar" style=${{ flexWrap: "wrap", gap: 10 }}>
         <label>分析主题</label>
@@ -2404,11 +2489,54 @@ function ReportGen({ me, onGenerated }) {
             <option key=${p} value=${p}>${p}</option>`)}
         </select>
 
+        ${theme === "monthly" ? html`
+          <label class="word-opt"
+                 title="直接填充赛题提供的 .docx 模板，保留其字体/表格样式">
+            <input type="checkbox" checked=${word}
+                   onChange=${e => setWord(e.target.checked)} />
+            使用 Word 模板
+          </label>` : null}
+
+        ${theme === "monthly" ? html`
+          <label class="word-opt"
+                 title="用个人工作区里的成本汇总覆盖共享基线；其余明细仍用共享数据">
+            <input type="checkbox" checked=${usePersonal}
+                   onChange=${e => setUsePersonal(e.target.checked)} />
+            使用我的上传数据
+          </label>` : null}
+
         <button class="chip" type="button" disabled=${busy} onClick=${gen}>
           ${busy ? "生成中…（要调大模型，约 10-30 秒）" : "生成报告"}
         </button>
       </div>
-      ${msg ? html`<div class="alert ok" style=${{ marginTop: 10 }}>✅ ${msg}</div>` : null}
+      ${msg ? html`<div class="alert ok" style=${{ marginTop: 10 }}>
+        ✅ ${msg}
+        ${wordFile ? html`
+          <a class="chip" style=${{ marginLeft: 8 }}
+             href=${(scope === "personal" ? "/api/control/my-download?name="
+                                          : "/api/control/download?name=")
+                    + encodeURIComponent(wordFile)}>
+            下载 Word
+          </a>` : null}
+        ${personalFile ? html`
+          <a class="chip" style=${{ marginLeft: 8 }}
+             href=${"/api/control/my-download?name=" + encodeURIComponent(personalFile)}>
+            下载 Markdown
+          </a>` : null}
+      </div>` : null}
+      ${sources && sources.scope === "personal" ? html`
+        <div class="alert" style=${{ marginTop: 8 }}>
+          <strong>数据来源：</strong>
+          ${(sources.personal_files || []).length
+            ? "个人成本汇总 " + sources.personal_files.join("、")
+            : "未找到可用个人成本汇总，已回退共享"}
+          ${(sources.personal_keys || []).length
+            ? html`<div>使用：${sources.personal_keys.join("、")}</div>` : null}
+          ${(sources.overridden_keys || []).length
+            ? html`<div>覆盖共享：${sources.overridden_keys.join("、")}</div>` : null}
+          <div>其余报表数据来自共享基线。</div>
+          ${(sources.warnings || []).map((w, i) => html`<div key=${i}>⚠️ ${w}</div>`)}
+        </div>` : null}
       ${err ? html`<div class="alert" style=${{ marginTop: 10 }}>${err}</div>` : null}
     </details>`;
 }
@@ -2416,12 +2544,18 @@ function ReportGen({ me, onGenerated }) {
 
 function ExportBar({ me }) {
   const [docs, setDocs] = useState(null);
+  const [myDocs, setMyDocs] = useState(null);
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
 
+  const refreshMy = () =>
+    api("/api/control/my-reports").then(d => setMyDocs(d._error ? null : d));
+
   useEffect(() => {
-    if (!me) { setDocs(null); return; }
+    if (!me) { setDocs(null); setMyDocs(null); return; }
     api("/api/control/exports").then(d => setDocs(d._error ? null : d));
+    refreshMy();
+    // eslint-disable-next-line
   }, [me]);
 
   /* POST 拿文件流，用 blob 下载——不能直接 <a href>，导出要带会话 cookie。
@@ -2452,12 +2586,60 @@ function ExportBar({ me }) {
     setBusy("");
   };
 
+  const doMyExport = async (md, fmt) => {
+    const key = "my-" + md + fmt;
+    setBusy(key); setErr("");
+    try {
+      const r = await fetch("/api/control/my-export", {
+        method: "POST", credentials: "same-origin",
+        headers: writeHeaders(),
+        body: JSON.stringify({ kind: "report", md, fmt, charts: true }),
+      });
+      if (r.status === 401 || r.status === 403)
+        throw new Error("登录已过期，请重新登录");
+      if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+      const blob = await r.blob();
+      const cd = r.headers.get("content-disposition") || "";
+      const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/.exec(cd);
+      const name = m ? decodeURIComponent(m[1]) : `${md}.${fmt}`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) { setErr("个人导出失败：" + String(e.message || e)); }
+    setBusy("");
+  };
+
   if (!me) return html`<${LoginGate} what="文档导出"
                                onGoLogin=${() => (location.hash = "login")} />`;
 
   return html`
-    <${ReportGen} me=${me} onGenerated=${() =>
-      api("/api/control/exports").then(d => { if (!d._error) setDocs(d); })} />
+    <${ReportGen} me=${me} onGenerated=${() => {
+      api("/api/control/exports").then(d => { if (!d._error) setDocs(d); });
+      refreshMy();
+    }} />
+
+    <details class="wsbox" open=${!!(myDocs && myDocs.count)}>
+      <summary>我的报告 <span class="hint">个人数据生成，仅自己可见</span></summary>
+      ${err ? html`<div class="alert" style=${{ margin: "8px 0" }}>⚠️ ${err}</div>` : null}
+      ${myDocs && myDocs.items && myDocs.items.length ? html`
+        ${myDocs.items.map(r => html`
+          <div class="exp-row" key=${r.name}>
+            <span class="exp-name">${r.stem.replace("_", " · ")}</span>
+            <a class="chip" href=${"/api/control/my-download?name=" + encodeURIComponent(r.name)}>
+              下载 ${r.kind.toUpperCase()}
+            </a>
+            ${r.kind === "md" ? ["docx", "pdf"].map(f => html`
+              <button key=${f} class="chip" disabled=${!!busy}
+                      onClick=${() => doMyExport(r.name, f)}>
+                ${busy === "my-" + r.name + f ? "导出中…" : f.toUpperCase() + "（含图）"}
+              </button>`) : null}
+          </div>`)}` : html`
+        <div class="empty" style=${{ padding: "18px 0" }}>
+          暂无个人报告。生成时勾选「使用我的上传数据」后，报告会出现在这里。
+        </div>`}
+    </details>
 
     <details class="wsbox">
       <summary>导出文档 <span class="hint">Word / PDF</span></summary>
@@ -2646,71 +2828,138 @@ function HomeForecast() {
   }, [prod, product]);
 
   const q = product
-    ? `/api/forecast?product=${encodeURIComponent(product)}&horizon=2` : "";
+    ? `/api/forecast/scenarios?product=${encodeURIComponent(product)}` : "";
   const { data, loading, error } = useApi(q || "/api/products");
 
   if (!product || loading) return html`<section class="home-sec"><${Loading} /></section>`;
   if (error) return html`<section class="home-sec"><${ErrorBox} msg=${error} /></section>`;
-  if (!data || !data.predictions || !data.predictions.length) return null;
+  if (!data || data.ok === false) {
+    return html`<section class="home-sec">
+      <${ErrorBox} msg=${(data && data.error) || "情景预测暂时不可用"} />
+    </section>`;
+  }
+  if (!data.scenarios || !data.expected_unit_cost) return null;
 
-  const last = data.history[data.history.length - 1];
-  const p1 = data.predictions[0];
-  const chg = last ? (p1.预测值 - last.单位成本) : 0;
+  const last = data.history && data.history.length
+    ? data.history[data.history.length - 1] : null;
+  const range = data.scenario_range || {};
+  const chg = last && last.单位成本 != null
+    ? data.expected_unit_cost - last.单位成本 : null;
+  const pct = chg != null && last.单位成本
+    ? chg / last.单位成本 * 100 : null;
+
+  const hist = (data.history || []).filter(h => h.单位成本 != null);
+  const lineRows = hist.map((h, i) => ({
+    月份: h.月份,
+    单位成本: h.单位成本,
+    预测值: i === hist.length - 1 ? h.单位成本 : null,
+  }));
+  lineRows.push({
+    月份: data.forecast_month,
+    单位成本: null,
+    预测值: data.expected_unit_cost,
+  });
+  const lineColors = [
+    { key: "单位成本", label: "历史实绩", color: "#0F766E" },
+    { key: "预测值", label: "下月预测", color: "#F59E0B" },
+  ];
+
+  const components = [
+    { key: "material", label: "直接材料", color: "#0F766E" },
+    { key: "labor", label: "直接人工", color: "#F59E0B" },
+    { key: "overhead", label: "制造费用", color: "#6366F1" },
+  ].map(c => ({ ...c, value: (data.component_expectations || {})[c.key] }));
+  const compItems = components.map(c => ({ name: c.label, value: c.value, color: c.color }));
+
+  const scenarios = data.scenarios || [];
+  const scenarioItems = scenarios.map((s, i) => ({
+    label: `${s.from_month.slice(5)}→${s.to_month.slice(5)}`,
+    value: s.unit_cost,
+    color: i === scenarios.length - 1 ? "#F59E0B" : "#0F766E",
+  }));
 
   return html`
     <section class="home-sec">
-      <div class="card fc-card">
-        <h2>成本趋势预测
-          <span class="fc-tag">外推</span>
-          <span class="hint">${data.method}　·　样本 ${data.n_samples} 个点</span>
+      <div class="sec-head">
+        <h2 class="sec-title">成本趋势预测
+          <span class="sec-hint">历史情景法 · 下月外推</span>
         </h2>
-        <p class="card-sub">
-          基于历史单位成本外推，<strong>不是已发生的数</strong>——
-          预测值没有原始坐标，与看板其余数字的性质不同，请连同区间一起读。
-        </p>
-
-        <div class="toolbar" style=${{ marginBottom: 16 }}>
-          <label>产品</label>
+        <div class="toolbar">
           <select value=${product} onChange=${e => setProduct(e.target.value)}>
             ${((prod && prod.products) || []).map(p => html`
               <option key=${p} value=${p}>${p}</option>`)}
           </select>
+          <span class="pill">共享基线</span>
+        </div>
+      </div>
+
+      <div class="chart2">
+        <div class="card fc-card">
+          <h3>历史实绩与下月预测</h3>
+          <p class="card-sub">
+            ${data.method}${data.weighting ? " · " + data.weighting : ""}
+          </p>
+          <div style=${{ display: "flex", flexWrap: "wrap", gap: 24,
+                          alignItems: "flex-end", marginBottom: 14 }}>
+            <div>
+              <div class="hint">下月期望</div>
+              <div style=${{ font: "700 30px/1.1 var(--mono)", color: "var(--ink)",
+                              letterSpacing: "-1px" }}>
+                ${fmt(data.expected_unit_cost)}
+                <span style=${{ fontSize: 12, fontWeight: 400, color: "var(--muted)",
+                                marginLeft: 4 }}>元/盒</span>
+              </div>
+            </div>
+            <div>
+              <div class="hint">情景范围</div>
+              <div style=${{ font: "600 18px/1.5 var(--mono)", color: "var(--ink)" }}>
+                ${fmt(range.lower)} ~ ${fmt(range.upper)}
+              </div>
+            </div>
+            <div>
+              <div class="hint">相对 ${data.as_of}</div>
+              <div class=${cls(chg)} style=${{ fontSize: 18, fontWeight: 650 }}>
+                ${chg != null && pct != null
+                  ? `${ARROW(chg)} ${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`
+                  : "—"}
+              </div>
+            </div>
+            <div>
+              <div class="hint">历史样本</div>
+              <div style=${{ fontSize: 15, fontWeight: 600, color: "var(--ink)" }}>
+                ${data.n_samples} 个月
+              </div>
+            </div>
+          </div>
+          <${LineChart} series=${lineRows} colors=${lineColors} height=${300}
+             title=${`单位成本-${data.as_of}-${data.forecast_month}`} />
         </div>
 
-        <table class="tbl">
-          <thead><tr>
-            <th>月份</th><th class="num">预测值（元/盒）</th>
-            <th class="num">参考区间</th><th>相对上月实际</th>
-          </tr></thead>
-          <tbody>
-            <tr>
-              <td>${last.月份}<span class="hint">（实际）</span></td>
-              <td class="num">${fmt(last.单位成本)}</td>
-              <td class="num">—</td><td>—</td>
-            </tr>
-            ${data.predictions.map(p => html`
-              <tr key=${p.月份}>
-                <td>${p.月份}</td>
-                <td class="num strong">${fmt(p.预测值)}</td>
-                <td class="num">${fmt(p.下限)} ~ ${fmt(p.上限)}</td>
-                <td class=${cls(p.步长 === 1 ? chg : (p.预测值 - last.单位成本))}>
-                  ${p.步长 === 1 && last
-                    ? `${ARROW(chg)} ${(chg / last.单位成本 * 100).toFixed(2)}%`
-                    : "—"}
-                </td>
-              </tr>`)}
-          </tbody>
-        </table>
-
-        ${(data.warnings || []).length ? html`
-          <div class="fc-warn">
-            ${data.warnings.map((w, i) => html`<div key=${i}>⚠️ ${w}</div>`)}
-          </div>` : null}
+        <div class="card">
+          <h3>下月成本构成期望</h3>
+          <p class="card-sub">按近期加权历史情景计算的材料、人工与制造费用。</p>
+          <${DonutChart} items=${compItems} total=${data.expected_unit_cost}
+             unit="元/盒" height=${300}
+             title=${`下月成本构成-${data.forecast_month}`} />
+        </div>
       </div>
+
+      <div class="card">
+        <h3>5 个历史情景对比</h3>
+        <p class="card-sub">
+          每个情景把当期原料行情、工时效率与产量摊薄联合应用；
+          越接近当前月的情景权重越高，最后一根是最近情景。
+        </p>
+        <${BarChart} items=${scenarioItems} height=${260}
+          title=${`历史情景-${product}`} />
+      </div>
+
+      <p class="sec-foot">
+        预测为外推，没有 raw 坐标；情景范围是 5 个历史情景的最低~最高，
+        不是统计置信区间。当前使用共享基线，个人成本汇总不参与预测。
+      </p>
     </section>`;
 }
-
-
 function HomeHeatmap() {
   const { data, loading, error } = useApi("/api/heatmap");
   const [el, setEl] = useState("单位材料");
@@ -2874,8 +3123,11 @@ const TABS = [
   { id: "login",     label: "登录" },
 ];
 
-// 导航条上真正显示的那些（profile/login 走顶栏与跳转，不占导航）
-const NAV_TABS = TABS.filter(t => t.id !== "profile" && t.id !== "login");
+// 导航条上真正显示的那些（profile/login 走顶栏与跳转，不占导航）。
+// 「数据说明 / 更新记录」是内部/审计视角，面向普通用户不占一级导航；
+// 它们仍在 TABS 里，直接 URL 和页脚入口都能到达。
+const NAV_TABS = TABS.filter(
+  t => !["profile", "login", "notes", "history"].includes(t.id));
 
 /* 旧链接兼容：`#overview` / `#chat` / `#panel` 都指向首页。
  * 用户可能存了旧书签，或分享过带旧锚点的链接——
@@ -3001,6 +3253,10 @@ function App() {
       </div>
 
       <footer class="foot">
+        <a href="#notes">数据口径说明</a>
+        <span> · </span>
+        <a href="#history">更新记录</a>
+        <span> ｜ </span>
         本系统所有数字均可在原始资料中逐项核对 ｜ 分析文本由 AI 辅助生成，请结合业务判断
       </footer>
     </div>`;

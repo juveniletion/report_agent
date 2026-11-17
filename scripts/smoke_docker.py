@@ -116,6 +116,17 @@ def main() -> int:
     except urllib.error.HTTPError as e:
         rec(False, "GET /api/auth/me", str(e.code))
 
+    try:
+        st, d, _ = c.get("/api/control/my-reports")
+        rec(st == 200 and "items" in d, "GET /api/control/my-reports")
+    except urllib.error.HTTPError as e:
+        rec(False, "GET /api/control/my-reports", f"HTTP {e.code}")
+    try:
+        st, d, _ = c.get("/api/control/my-download?name=../secret.txt")
+        rec(st == 404, "个人报告下载拒绝路径穿越", f"HTTP {st}")
+    except urllib.error.HTTPError as e:
+        rec(e.code == 404, "个人报告下载拒绝路径穿越", f"HTTP {e.code}")
+
     # 未认证的边界：**写操作**必须被拒（只读看板是刻意公开的，见下方说明）
     anon = Client(B)
     for name, path, body in [
@@ -151,6 +162,8 @@ def main() -> int:
         ("products", "/api/products"),
         ("benchmark", f"/api/benchmark?{P}"),
         ("forecast", f"/api/forecast?{P}"),
+        ("forecast/scenarios",
+         "/api/forecast/scenarios?" + urllib.parse.urlencode({"product": "银黄口服液"})),
         ("rpa/health", "/api/rpa/health"),
         ("control/exports", "/api/control/exports"),
     ]:
@@ -160,6 +173,27 @@ def main() -> int:
         except urllib.error.HTTPError as e:
             rec(False, f"GET {path.split('?')[0]}",
                 f"HTTP {e.code} {e.read().decode()[:90]}")
+
+    # ---- 3.1 检索：健康接口必须暴露混合/降级状态 ----
+    try:
+        st, h, _ = c.get("/api/health")
+        r = (h or {}).get("retrieval") or {}
+        rec(st == 200 and isinstance(r, dict) and "vector" in r,
+            "健康接口暴露检索状态",
+            f"vector={r.get('vector')} reason={r.get('reason')}")
+        q = urllib.parse.urlencode({"q": "金银花", "top_k": 3})
+        st, s, _ = c.get("/api/search?" + q)
+        rec(st == 200 and s.get("mode") in ("hybrid", "bm25"),
+            "检索接口返回混合/降级模式",
+            f"mode={s.get('mode')} count={s.get('count')}")
+        if r.get("vector"):
+            rec(s.get("mode") == "hybrid", "混合检索实际生效",
+                f"mode={s.get('mode')}")
+        else:
+            rec(True, "检索降级可见（未启用向量）",
+                f"reason={r.get('reason')}")
+    except urllib.error.HTTPError as e:
+        rec(False, "检索状态检查", f"HTTP {e.code} {e.read().decode()[:90]}")
 
     # exports 不应含 techspec（交付物文档不进站点）
     try:

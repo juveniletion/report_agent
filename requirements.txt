@@ -27,16 +27,23 @@ langchain-core>=1.0
 langgraph>=1.0
 httpx>=0.27
 
+# ---- 检索 embedding（本地 ONNX，无需外部 Key）----
+# 默认 bge-small-zh-v1.5：512 维、约 90MB、MIT、中文专用。
+# fastembed 自带 onnxruntime；模型在 Docker 构建时下载并烘进镜像，
+# 运行期完全离线（也可设 EMBED_PROVIDER=siliconflow 切回 bge-m3）。
+fastembed>=0.9,<0.10
+
 # ---- 配置 ----
 python-dotenv>=1.0
 
 # =============================================================================
 # 说明：**本文件只列部署必需项**。下列能力有则增强、无则优雅降级：
 #
-#   · 混合检索的向量侧（`retrieval.py`）需要联网调 SiliconFlow 的
-#     `BAAI/bge-m3`。无网/无 Key 时自动退回纯 BM25，功能不中断。
-#     （不引入 sentence-transformers——它会拖进 torch，镜像体积翻十倍，
-#       而本项目检索的向量部分走 HTTP API，不需要本地推理。）
+#   · 向量检索默认走**本地 ONNX**（fastembed + `BAAI/bge-small-zh-v1.5`），
+#     无网、无 Key 也能用；设 `EMBED_PROVIDER=siliconflow` 可切到
+#     SiliconFlow 的 `BAAI/bge-m3`（需要 Key/网络）。
+#     （不引入 sentence-transformers——它会拖进 torch，镜像体积翻十倍；
+#       fastembed 只需要 onnxruntime，CPU 推理足够本项目的 160 个 chunk。）
 #
 # =============================================================================
 

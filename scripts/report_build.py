@@ -236,6 +236,65 @@ def display_priority(v: Any) -> str:
     return {"high": "高", "medium": "中", "low": "低"}[rpa]
 
 
+def deterministic_advice(fs: RF.FactSet, th: Dict[str, Any],
+                         month: str) -> List[Dict[str, str]]:
+    """
+    **无 LLM 时的改进建议**：只按已算好的事实做规则映射。
+
+    这不是"假装 AI 写的"：
+      · 有超阈值要素 → 每项生成一条复核任务
+      · 无超阈值     → 跟踪贡献度最高的要素
+      · 责任部门/优先级/截止时间是固定规则，数字全部来自 FactSet
+    报告顶部的「演示模式」会明确标注建议由规则生成。
+    """
+    def val(key: str) -> Optional[float]:
+        f = fs.facts.get(key)
+        return None if f is None else f.value
+
+    try:
+        y, m = int(month[:4]), int(month[5:7])
+    except (ValueError, IndexError):
+        y, m = 2026, 1
+    ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+    due = f"{ny:04d}-{nm:02d}-15"
+
+    DEPT = {
+        "直接材料": "采购部",
+        "直接人工": "生产部",
+        "制造费用": "设备部",
+    }
+    advice: List[Dict[str, str]] = []
+
+    for label, display in (th.get("breaches") or [])[:3]:
+        mnum = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%", str(display))
+        pct = abs(float(mnum.group(1))) if mnum else 0.0
+        advice.append({
+            "建议事项": f"复核{label}环比异常（{display}），制定下月回落措施",
+            "责任部门": DEPT.get(label, "财务部"),
+            "优先级": "高" if pct >= 15 else "中",
+            "预期效果": f"下月回落至 ±{th.get('threshold', 10):.0f}% 阈值内",
+            "建议完成时间": due,
+        })
+
+    if not advice:
+        cands = [
+            ("直接材料", "材料贡献度", "采购部"),
+            ("直接人工", "人工贡献度", "生产部"),
+            ("制造费用", "制造费用贡献度", "设备部"),
+        ]
+        best = max(cands, key=lambda x: abs(val(x[1]) or 0))
+        share = val(best[1])
+        if share is not None:
+            advice.append({
+                "建议事项": f"持续跟踪{best[0]}（贡献度 {share:.1f}%）的月度波动，复核预算偏差",
+                "责任部门": best[2],
+                "优先级": "中",
+                "预期效果": "将单位成本预算偏差控制在 ±5% 以内",
+                "建议完成时间": due,
+            })
+    return advice
+
+
 def render_task_table(advice: List[Dict[str, str]], month: str,
                       product: str) -> str:
     """
@@ -755,11 +814,12 @@ def generate_analysis(fs: RF.FactSet, llm: Any, verbose: bool = True,
 # 四、编排
 # ---------------------------------------------------------------------------
 
-def build(product: str, month: str, use_llm: bool = True,
-          verbose: bool = True,
-          template_docx: Optional[str] = None,
-          docx_out_path: Optional[str] = None,
-          theme: str = "monthly", period: str = "") -> Dict[str, Any]:
+def _build_impl(product: str, month: str, use_llm: bool = True,
+                verbose: bool = True,
+                template_docx: Optional[str] = None,
+                docx_out_path: Optional[str] = None,
+                theme: str = "monthly", period: str = "",
+                out_dir: Optional[Path] = None) -> Dict[str, Any]:
     """
     `theme`（赛题 5.1.3 的「分析主题」）：
 
@@ -818,6 +878,11 @@ def build(product: str, month: str, use_llm: bool = True,
 
     # 波动告警结论先由脚本定死，再决定要不要让 LLM 写重点分析
     th = evaluate_threshold(fs)
+    if not use_llm:
+        # 无 LLM 时的确定性建议/整改任务：规则生成，数字来自 FactSet。
+        _advice = deterministic_advice(fs, th, month)
+        vals["改进建议表格"] = render_advice_table(_advice)
+        vals["整改任务表格"] = render_task_table(_advice, month, fs.product)
     if verbose:
         n = len(th["breaches"])
         print(f"  波动阈值判定（脚本，±{th['threshold']:.0f}%）："
@@ -849,12 +914,23 @@ def build(product: str, month: str, use_llm: bool = True,
     #   直接填那份 .docx 并保存，保留它的字体/表格样式/大纲。
     # 否则走默认的 .md 模板（产出 markdown，再按需导出 Word/PDF）。
     docx_out: Optional[Path] = None
+    charts_inserted = 0
     if template_docx is not None:
         import template_docx as TD
         docx_out, missing = TD.fill_docx(
-            Path(template_docx), vals, Path(docx_out_path or (OUT_DIR / f"{product}_{month}.docx")),
+            Path(template_docx), vals,
+            Path(docx_out_path or ((out_dir or OUT_DIR) / f"{product}_{month}.docx")),
             blank_keys={"重点分析段落"})
-        report = f"（已按 Word 模板生成：{docx_out.name}）"
+        # 赛题 5.1.3「图表嵌入」：Word 模板路径同样生成三张图并插入。
+        # 与 export_doc 的 markdown 导出复用同一套 chart_render 数据，不新增计算。
+        try:
+            import export_doc as ED
+            charts = ED.build_report_charts(product, month, out_dir=docx_out.parent)
+            charts_inserted = TD.insert_chart_images(docx_out, charts)
+        except Exception as e:  # noqa: BLE001
+            print(f"    ⚠️ Word 模板图表插入失败：{type(e).__name__}: {e}")
+        note = f"，含 {charts_inserted} 张图" if charts_inserted else ""
+        report = f"（已按 Word 模板生成：{docx_out.name}{note}）"
     else:
         tpl_path = TEMPLATES.get(theme, TEMPLATE)
         if not tpl_path.exists():
@@ -872,9 +948,76 @@ def build(product: str, month: str, use_llm: bool = True,
         "facts": len(fs.facts),
         "conflicts": fs.conflicts,
         "data_missing": fs.missing,
+        "charts": charts_inserted,
+        "sources": getattr(fs, "sources", {}),
+        "warnings": getattr(fs, "warnings", []),
     }
     return {"report": report, "facts": fs, "stats": stats, "analysis": analysis,
             "docx": docx_out}
+
+
+def _source_note(stats: Dict[str, Any]) -> str:
+    """个人报告正文的来源说明（Markdown / Word 共用）。"""
+    srcs = stats.get("sources") or {}
+    if srcs.get("scope") != "personal":
+        return ""
+    parts: List[str] = []
+    pfiles = srcs.get("personal_files") or []
+    if pfiles:
+        parts.append("个人成本汇总：" + "、".join(pfiles))
+    else:
+        parts.append("个人成本汇总：未找到可用文件，已回退共享")
+    parts.append("成本汇总相关数值（含对标的一厂值）按上述来源；"
+                 "原材料/人工/制造费用/预算/行情等明细来自共享基线")
+    warns = stats.get("warnings") or []
+    if warns:
+        parts.append("警告：" + "；".join(warns[:3]))
+    return "数据来源：" + "；".join(parts)
+
+
+def _insert_md_source_note(report: str, note: str) -> str:
+    """在 Markdown 标题后插入来源说明，标题必须留在第一行。"""
+    import re as _re
+    parts = report.splitlines()
+    line = "> " + note
+    if parts and parts[0].startswith("# "):
+        return parts[0] + "\n\n" + line + "\n\n" + "\n".join(parts[1:]).lstrip("\n")
+    return line + "\n\n" + report
+
+
+def build(product: str, month: str, use_llm: bool = True,
+          verbose: bool = True,
+          template_docx: Optional[str] = None,
+          docx_out_path: Optional[str] = None,
+          theme: str = "monthly", period: str = "",
+          use_personal: bool = False,
+          personal_root: Optional[Path] = None,
+          out_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    报告生成入口。`use_personal=True` 时在个人成本汇总上下文内取数，
+    并把产物写到 `out_dir`（通常为个人工作区的 reports/）。
+    """
+    with RF.report_context(personal_root=personal_root,
+                           use_personal=use_personal) as ctx:
+        r = _build_impl(product, month, use_llm=use_llm, verbose=verbose,
+                        template_docx=template_docx,
+                        docx_out_path=docx_out_path,
+                        theme=theme, period=period, out_dir=out_dir)
+        stats = r["stats"]
+        stats["scope"] = "personal" if ctx.use_personal else "shared"
+        # 用 FactSet 的已过滤来源（按产品筛选），不要用全局 ctx
+        stats["sources"] = getattr(r.get("facts"), "sources", {}) or {"scope": stats["scope"]}
+        stats["warnings"] = list(getattr(r.get("facts"), "warnings", []) or [])
+        if ctx.use_personal:
+            note = _source_note(stats)
+            if note:
+                if r.get("docx"):
+                    import template_docx as TD
+                    TD.insert_source_note(Path(r["docx"]), note)
+                else:
+                    r["report"] = _insert_md_source_note(r["report"], note)
+                stats["source_note"] = note
+        return r
 
 
 def main() -> int:
